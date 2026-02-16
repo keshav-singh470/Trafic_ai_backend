@@ -1,0 +1,30 @@
+# Python logs and caches
+__pycache__/
+*.log
+*.txt
+!requirements.txt
+!blacklist.txt
+!classes.txt
+
+# Virtual environments
+venv/
+env/
+.env/
+.venv/
+Include/
+Lib/
+Scripts/
+pyvenv.cfg
+
+# Models (Track custom models, ignore large generic ones)
+models/
+!models/*.pt
+!no_sitbelt.pt
+
+# Video processing artifacts
+outputs/
+uploads/
+
+# IDE files
+.vscode/
+.idea/
