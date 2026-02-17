@@ -1,12 +1,15 @@
 import os
-# Fix OpenMP runtime conflict
+
+# Add these BEFORE any other imports
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-# Disable OneDNN and PIR features to fix PaddlePaddle compatibility issues on some CPUs
+os.environ["OMP_NUM_THREADS"] = "1"  # Limit OpenMP threads
 os.environ["FLAGS_enable_onednn"] = "0"
 os.environ["FLAGS_use_onednn"] = "0"
 os.environ["FLAGS_enable_pir_api"] = "0"
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
 os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "True"
+os.environ["GLOG_minloglevel"] = "2"  # Suppress verbose logs
+
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Form
 from fastapi.responses import JSONResponse
@@ -30,7 +33,11 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
-        "http://localhost:8000/"
+        "http://localhost:8000/",
+        "https://trafic-ai-frontend.vercel.app",
+        "https://ai-trafic.servepics.com/",
+        "https://ai-trafic.servepics.com",
+
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -39,6 +46,27 @@ app.add_middleware(
 
 UPLOAD_DIR = "uploads"
 OUTPUT_DIR = "outputs"
+
+print("Loading models once at startup...")
+
+ANPR_SERVICE = ANPRService(
+    base_model="models/yolov8n.pt",
+    anpr_model="models/anpr_plat.pt"
+)
+
+HELMET_SERVICE = HelmetService(model_path="models/helmet_triple_model.pt")
+OVERLOAD_SERVICE = OverloadService(model_path="models/helmet_triple_model.pt")
+WRONGSIDE_SERVICE = WrongSideService(
+    base_model="models/yolov8n.pt",
+    zones=[{
+        "polygon": Polygon([(960, 0), (1920, 0), (1920, 1080), (960, 1080)]),
+        "forbidden_classes": [2, 3, 5, 7]
+    }]
+)
+STALLED_SERVICE = StalledService(model_path="models/yolov8n.pt")
+SEATBELT_SERVICE = SeatbeltService(model_path="no_sitbelt.pt")
+
+print("All models loaded.")
 
 def check_dirs():
     os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -53,29 +81,17 @@ jobs: Dict[str, Dict] = {}
 
 def get_service(case_type: str):
     if case_type in ["anpr", "security", "blacklist"]:
-        return ANPRService(
-            base_model="models/yolov8n.pt", 
-            anpr_model="models/anpr_plat.pt"
-        )
+        return ANPR_SERVICE
     elif case_type == "helmet":
-        # Use user-provided trained model (best (3).pt)
-        return HelmetService(model_path="models/helmet_triple_model.pt")
-    elif case_type == "overload" or case_type == "triple":
-        # Use same user-provided model for triple riding
-        return OverloadService(model_path="models/helmet_triple_model.pt")
-    elif case_type == "wrong_side" or case_type == "wrong_lane":
-        # Default Zone: Assume right half of a 1920x1080 frame is for oncoming traffic only
-        # So if we detect "car" (class 2) or "truck" (class 7) there, moving wrong way, it handles.
-        # But for Lane Logic: "If ANY vehicle is in this zone, it's wrong lane"
-        zones = [{
-             "polygon": Polygon([(960, 0), (1920, 0), (1920, 1080), (960, 1080)]),
-             "forbidden_classes": [2, 3, 5, 7] # Cars, Motorcycles, Buses, Trucks
-        }]
-        return WrongSideService(base_model="models/yolov8n.pt", zones=zones)
+        return HELMET_SERVICE
+    elif case_type in ["overload", "triple"]:
+        return OVERLOAD_SERVICE
+    elif case_type in ["wrong_side", "wrong_lane"]:
+        return WRONGSIDE_SERVICE
     elif case_type == "stalled":
-        return StalledService(model_path="models/yolov8n.pt")
+        return STALLED_SERVICE
     elif case_type == "seatbelt":
-        return SeatbeltService(model_path="no_sitbelt.pt")
+        return SEATBELT_SERVICE
     else:
         return None
 
@@ -93,15 +109,29 @@ def process_video_task(job_id: str, input_path: str, output_path: str, case_type
     try:
         print(">>> Job started:", job_id)
         jobs[job_id]["status"] = "processing"
-        service = get_service(case_type)
-        if not service: raise Exception("Invalid service type")
+        
+        # ❌ REMOVE THIS - Don't call get_service here
+        # service = get_service(case_type)
+        
+        # ✅ USE GLOBAL INSTANCES DIRECTLY
+        if case_type in ["anpr", "security", "blacklist"]:
+            service = ANPR_SERVICE
+        elif case_type == "helmet":
+            service = HELMET_SERVICE
+        elif case_type in ["overload", "triple"]:
+            service = OVERLOAD_SERVICE
+        # ... rest of your conditions
+        
+        if not service: 
+            raise Exception("Invalid service type")
 
         cap = cv2.VideoCapture(input_path)
         w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = int(cap.get(cv2.CAP_PROP_FPS))
         
         # Try multiple codecs for robustness
-        codecs = [('avc1', 'mp4'), ('mp4v', 'mp4'), ('XVID', 'avi'), ('MJPG', 'avi'), ('DIVX', 'avi')]
+        codecs = [('mp4v', 'mp4'), ('XVID', 'avi'), ('MJPG', 'avi'), ('DIVX', 'avi')]
+
         out = None
         final_output_path = output_path
         
