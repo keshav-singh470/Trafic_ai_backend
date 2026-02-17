@@ -33,16 +33,17 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[
         "http://localhost:5173",
-        "http://localhost:8000/",
+        "http://localhost:8000",
         "https://trafic-ai-frontend.vercel.app",
-        "https://ai-trafic.servepics.com/",
         "https://ai-trafic.servepics.com",
-
+        "http://ai-trafic.servepics.com",
     ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
 
 UPLOAD_DIR = "uploads"
 OUTPUT_DIR = "outputs"
