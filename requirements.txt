@@ -7,4 +7,3 @@ python-multipart
 opencv-python
 numpy<2.0.0
 openai-whisper
-easyocr
