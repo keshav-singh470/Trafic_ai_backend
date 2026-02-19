@@ -316,14 +316,15 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                         full_local = os.path.join(assets_dir, full_name)
                         crop_local = os.path.join(assets_dir, crop_name)
 
-                        # Use a clean copy of the frame for the alert background
-                        # to ensure no other vehicle boxes or text are drawn on it.
-                        clean_frame = frame.copy()
-                        cv2.imwrite(full_local, clean_frame)
-
+                        # Highlight the plate on the full image with a parrot-green box
+                        highlighted_frame = frame.copy()
                         b = res["box"]
                         x1, y1, x2, y2 = b
-                        crop = clean_frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+                        # Parrot-Green: (0, 255, 0), thickness: 3
+                        cv2.rectangle(highlighted_frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                        cv2.imwrite(full_local, highlighted_frame)
+
+                        crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
                         if crop.size > 0:
                             cv2.imwrite(crop_local, crop)
 
@@ -450,8 +451,13 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                         full_local = os.path.join(assets_dir, full_name)
                         crop_local = os.path.join(assets_dir, crop_name)
 
-                        cv2.imwrite(full_local, frame)
+                        # Highlight the violation area on the full image with a parrot-green box
+                        highlighted_frame = frame.copy()
+                        b = v["box"]
                         x1, y1, x2, y2 = b
+                        cv2.rectangle(highlighted_frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                        cv2.imwrite(full_local, highlighted_frame)
+
                         crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
                         if crop.size > 0:
                             cv2.imwrite(crop_local, crop)
