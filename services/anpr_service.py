@@ -126,55 +126,70 @@ class ANPRService(BaseTrafficService):
                 if t[i] in to_D: t[i] = to_D[t[i]]
                 
             # 4. Characters between District and Last Number: ALWAYS LETTERS
+            # Handles BOTH XX 00 X 0000 and XX 00 XX 0000 formats
             for i in range(4, length-4):
                 if t[i] in to_L: t[i] = to_L[t[i]]
+                # Special mapping for L to 1 is handled in to_D for digit areas, 
+                # but in letter area L is already correct.
         
         return "".join(t)
 
     def validate_indian_plate(self, text):
-        if not text or len(text) < 7 or len(text) > 11:
-            return False
-        # Improved Regex for Standard, BH series, and Old formats
-        std = r'^[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{4}$'
-        bh  = r'^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$'
-        old = r'^[A-Z]{2}[0-9]{1,2}[0-9]{4}$'
+        """
+        Hard rule: Must be exactly 9 or 10 characters and match regex.
+        """
+        if not text: return False
         
-        return bool(re.match(std, text) or re.match(bh, text) or re.match(old, text))
+        length = len(text)
+        if length not in [9, 10]:
+            return False
+
+        # XX 00 X 0000 (9) or XX 00 XX 0000 (10)
+        std = r'^[A-Z]{2}[0-9]{2}[A-Z]{1,2}[0-9]{4}$'
+        # Note: BH and Old formats usually don't fit 9 or 10 strictly but we follow requested rule.
+        # BH: 22BH1234AA (10)
+        bh = r'^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$'
+        
+        return bool(re.match(std, text) or re.match(bh, text))
 
     def extract_indian_plate(self, text):
-        # Look for the pattern within a larger string
-        std = r'[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{4}'
-        bh  = r'[0-9]{2}BH[0-9]{4}[A-Z]{1,2}'
-        old = r'[A-Z]{2}[0-9]{1,2}[0-9]{4}'
+        # We look for 9 or 10 character patterns
+        std_9  = r'[A-Z]{2}[0-9]{2}[A-Z]{1}[0-9]{4}'
+        std_10 = r'[A-Z]{2}[0-9]{2}[A-Z]{2}[0-9]{4}'
+        bh_10  = r'[0-9]{2}BH[0-9]{4}[A-Z]{1,2}'
         
-        for p in [std, bh, old]:
+        for p in [std_10, std_9, bh_10]:
             m = re.search(p, text)
             if m: return m.group(0)
         return None
 
     def calculate_score(self, original, corrected, conf):
         """
-        Scores a candidate:
-        - Regex match: +100
-        - Length 8-11: +20
-        - Confidence: +10 * conf
-        - Corrections: -5 * penalty
+        Scores a candidate with a strong pattern preference.
         """
         score = 0
         if not corrected: return -100
         
-        # Regex check
-        is_valid = self.validate_indian_plate(corrected)
-        if is_valid: score += 100
-        
-        # Length check
+        # 1. HARD RULE: Must be exactly 9 or 10 chars
         length = len(corrected)
-        if 8 <= length <= 11: score += 20
+        if length not in [9, 10]:
+            return -50 # Heavy penalty for wrong length
         
-        # Confidence factor
+        # 2. HARD RULE: Regex Match
+        is_valid = self.validate_indian_plate(corrected)
+        if is_valid: 
+            score += 200 # Major boost for valid format
+        else:
+            return -100 # Reject if not regex valid per requested hard rule
+
+        # 3. PREFERRED PATTERN: Starts with 2 letters, ends with 4 digits
+        if re.match(r'^[A-Z]{2}.*[0-9]{4}$', corrected):
+            score += 50
+        
+        # 4. Confidence factor
         score += int(conf * 10)
         
-        # Penalty for changes (fewer changes = more trust in OCR)
+        # 5. Translation penalty
         diffs = sum(1 for a, b in zip(original, corrected) if a != b)
         score -= (diffs * 5)
         
@@ -277,13 +292,14 @@ class ANPRService(BaseTrafficService):
         avg_conf = sum([r[2] for r in results]) / len(results)
         return full_text, avg_conf
 
-    def process_plate(self, plate_img):
+    def process_plate(self, plate_img, modes=None):
         if plate_img is None or plate_img.size == 0:
             return ""
             
         candidates = []
-        # MULTI-PASS OCR
-        modes = ['standard', 'sharpened', 'high_contrast', 'extreme']
+        # Fallback to default modes if none provided
+        if modes is None:
+            modes = ['standard', 'sharpened', 'high_contrast']
         
         for mode in modes:
             processed = self.preprocess_for_ocr(plate_img, mode=mode)
@@ -308,7 +324,6 @@ class ANPRService(BaseTrafficService):
                 "score": score
             })
             
-            # Log all candidates for debugging
             self.log_debug(f"Candidate ({mode}): raw='{raw_text}' final='{final_text}' score={score} conf={conf:.2f}")
 
         if not candidates:
@@ -318,9 +333,8 @@ class ANPRService(BaseTrafficService):
         candidates.sort(key=lambda x: x["score"], reverse=True)
         best = candidates[0]
         
-        # If best score is too low or not regex valid, return low confidence
-        if best["score"] < 100: # 100 is base for regex match
-            self.log_debug(f"⚠️ LOW CONFIDENCE: Best candidate '{best['final']}' score {best['score']}")
+        # Hard Rule: We only accept score >= 200 (since 200 is only possible with regex match)
+        if best["score"] < 200:
             return "LOW_CONFIDENCE"
             
         self.log_debug(f"✅ SELECTED: '{best['final']}' (Pass: {best['mode']}, Score: {best['score']})")
@@ -379,21 +393,29 @@ class ANPRService(BaseTrafficService):
                     zone["reported_frame"] = -1
                     zone["best_plate"]     = None
 
-            # ── Collect OCR reading ───────────────────────
-            # Internal crop with slightly larger padding for OCR (12%)
-            pad_w = int((x2 - x1) * 0.12)
-            pad_h = int((y2 - y1) * 0.12)
-            px1, py1 = max(0, x1 - pad_w), max(0, y1 - pad_h)
-            px2, py2 = min(w, x2 + pad_w), min(h, y2 + pad_h)
+            # ── 1. First OCR Attempt (12% padding) ──────────
+            pad1 = int((x2 - x1) * 0.12)
+            px1, py1 = max(0, x1 - pad1), max(0, y1 - pad1)
+            px2, py2 = min(w, x2 + pad1), min(h, y2 + pad1)
             
-            plate_img = frame[py1:py2, px1:px2]
-            best_plate = self.process_plate(plate_img)
+            plate_img1 = frame[py1:py2, px1:px2]
+            best_plate = self.process_plate(plate_img1, modes=['standard', 'sharpened', 'high_contrast'])
             
+            # ── 2. Retry Attempt (25% padding + Extreme) ─────
+            if not best_plate or best_plate == "LOW_CONFIDENCE":
+                self.log_debug(f"Frame {frame_count}: Retry OCR with 25% padding and extreme mode...")
+                pad2 = int((x2 - x1) * 0.25)
+                rx1, ry1 = max(0, x1 - pad2), max(0, y1 - pad2)
+                rx2, ry2 = min(w, x2 + pad2), min(h, y2 + pad2)
+                
+                plate_img2 = frame[ry1:ry2, rx1:rx2]
+                best_plate = self.process_plate(plate_img2, modes=['extreme'])
+
             if best_plate and best_plate != "LOW_CONFIDENCE":
                 zone["readings"].append(best_plate)
 
             self.log_debug(
-                f"Frame {frame_count}: zone {zone_idx} reading='{best_plate}' "
+                f"Frame {frame_count}: zone {zone_idx} outcome='{best_plate}' "
                 f"total_votes={len(zone['readings'])}"
             )
 
