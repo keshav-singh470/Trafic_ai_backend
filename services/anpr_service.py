@@ -6,6 +6,7 @@ from datetime import datetime
 from collections import Counter
 from ultralytics import YOLO
 import easyocr
+import numpy as np
 from difflib import SequenceMatcher
 from .base import BaseTrafficService
 
@@ -99,45 +100,55 @@ class ANPRService(BaseTrafficService):
 
     def fix_common_ocr_errors(self, text):
         """
-        Indian plate format: XX 00 XX 0000
-        pos 0-1 → letters, pos 2-3 → digits,
-        middle 0-3 chars → letters, last 4 → digits
+        Refined Indian plate correction logic.
         """
-        if len(text) < 8:
-            return text
-
-        L = {'0':'O','1':'I','5':'S','8':'B','6':'G','2':'Z'}
-        D = {'O':'0','I':'1','L':'1','S':'5','B':'8','G':'6','Z':'2','Q':'0'}
+        if not text:
+            return ""
+            
+        # Common confusions
+        L = {'0':'O','1':'I','5':'S','8':'B','6':'G','2':'Z', '4':'A'}
+        D = {'O':'0','I':'1','L':'1','S':'5','B':'8','G':'6','Z':'2','Q':'0', 'A':'4', 'D':'0'}
 
         t = list(text)
-        # First 2 must be letters
-        for i in [0, 1]:
-            if i < len(t) and t[i] in L:
+        length = len(t)
+        
+        # Indian plates usually start with 2 letters (State Code)
+        for i in range(min(2, length)):
+            if t[i] in L:
                 t[i] = L[t[i]]
-        # Pos 2-3 must be digits
-        for i in [2, 3]:
-            if i < len(t) and t[i] in D:
-                t[i] = D[t[i]]
-        # Last 4 must be digits
-        for i in range(max(0, len(t)-4), len(t)):
+        
+        # Next 2 are usually digits (District Code)
+        for i in range(2, min(4, length)):
             if t[i] in D:
                 t[i] = D[t[i]]
+                
+        # Last 4 are always digits
+        for i in range(max(0, length-4), length):
+            if t[i] in D:
+                t[i] = D[t[i]]
+                
         return ''.join(t)
 
     def validate_indian_plate(self, text):
-        if len(text) < 8 or len(text) > 12:
+        if not text or len(text) < 7 or len(text) > 12:
             return False
-        std = r'^[A-Z]{2}[0-9]{1,2}[A-Z]{0,2}[0-9]{4}$'
-        bh  = r'^[0-9]{2}BH[0-9]{1,4}[A-Z]{1,2}[0-9]{1,4}$'
-        return bool(re.match(std, text) or re.match(bh, text))
+        # General Standard: XX 00 XX 0000 or XX 00 X 0000
+        std = r'^[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{4}$'
+        # BH Series: 22 BH 1234 AA
+        bh  = r'^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$'
+        # Old Format: XX 00 0000
+        old = r'^[A-Z]{2}[0-9]{1,2}[0-9]{4}$'
+        
+        return bool(re.match(std, text) or re.match(bh, text) or re.match(old, text))
 
     def extract_indian_plate(self, text):
-        std = r'[A-Z]{2}[0-9]{1,2}[A-Z]{0,3}[0-9]{4}'
-        bh  = r'[0-9]{2}BH[0-9]{1,4}[A-Z]{1,2}[0-9]{1,4}'
-        m = re.search(std, text)
-        if m: return m.group(0)
-        m = re.search(bh, text)
-        if m: return m.group(0)
+        std = r'[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{4}'
+        bh  = r'[0-9]{2}BH[0-9]{4}[A-Z]{1,2}'
+        old = r'[A-Z]{2}[0-9]{1,2}[0-9]{4}'
+        
+        for p in [std, bh, old]:
+            m = re.search(p, text)
+            if m: return m.group(0)
         return None
 
     # ── Spatial helpers ───────────────────────────────────────
@@ -189,25 +200,84 @@ class ANPRService(BaseTrafficService):
         return candidate if self.validate_indian_plate(candidate) else None
 
     # ── OCR ───────────────────────────────────────────────────
+    def preprocess_for_ocr(self, img, mode='standard'):
+        """
+        Advanced preprocessing for license plates.
+        Modes: 'standard', 'high_contrast', 'sharpened'
+        """
+        if img is None or img.size == 0: return None
+        
+        # 1. Resize (3x) for better OCR
+        img = cv2.resize(img, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        
+        # 2. Grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        if mode == 'high_contrast':
+            # Adaptive Thresholding for tough lighting
+            processed = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+                                             cv2.THRESH_BINARY, 11, 2)
+        elif mode == 'sharpened':
+            # Bilateral Filter (Noise Reduction) + Sharpen
+            denoised = cv2.bilateralFilter(gray, 9, 75, 75)
+            kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+            processed = cv2.filter2D(denoised, -1, kernel)
+        else: # standard
+            # CLAHE (Contrast Enhancement)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced = clahe.apply(gray)
+            processed = cv2.fastNlMeansDenoising(enhanced, None, 10, 7, 21)
+            
+        return processed
+
+    def _ocr_pass(self, processed_img):
+        """Helper for a single OCR pass with confidence score."""
+        with OCR_LOCK:
+            results = self.ocr.readtext(
+                processed_img, 
+                allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+            )
+        # results = [(bbox, text, conf), ...]
+        if not results: return "", 0.0
+        
+        full_text = " ".join([r[1] for r in results])
+        avg_conf = sum([r[2] for r in results]) / len(results)
+        return full_text, avg_conf
+
     def process_plate(self, plate_img):
         if plate_img is None or plate_img.size == 0:
             return ""
-        try:
-            resized   = cv2.resize(plate_img, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
-            gray      = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
-            clahe     = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            enhanced  = clahe.apply(gray)
-            denoised  = cv2.fastNlMeansDenoising(enhanced, None, 10, 7, 21)
-
-            with OCR_LOCK:
-                results = self.ocr.readtext(
-                    denoised, detail=0,
-                    allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-                )
-            return " ".join(results) if results else ""
-        except Exception as e:
-            self.log_debug(f"OCR error: {e}")
-            return ""
+            
+        best_text = ""
+        max_conf = -1.0
+        
+        # MULTI-PASS OCR
+        modes = ['standard', 'sharpened', 'high_contrast']
+        
+        for mode in modes:
+            processed = self.preprocess_for_ocr(plate_img, mode=mode)
+            if processed is None: continue
+            
+            raw_text, conf = self._ocr_pass(processed)
+            clean_text = self.clean_plate_text(raw_text)
+            clean_text = self.fix_common_ocr_errors(clean_text)
+            extracted  = self.extract_indian_plate(clean_text)
+            
+            final_text = extracted if extracted else clean_text
+            is_valid = self.validate_indian_plate(final_text)
+            
+            self.log_debug(f"OCR Pass ({mode}): raw='{raw_text}' clean='{final_text}' conf={conf:.2f} valid={is_valid}")
+            
+            # If we found a valid plate with decent confidence, we can stop
+            if is_valid and conf > 0.6:
+                return final_text
+                
+            # Otherwise, keep track of the highest confidence result
+            if conf > max_conf:
+                max_conf = conf
+                best_text = final_text
+                
+        return best_text
 
     # ── Main detection ────────────────────────────────────────
     def run_detection(self, frame, frame_count):

@@ -324,7 +324,15 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                         cv2.rectangle(highlighted_frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
                         cv2.imwrite(full_local, highlighted_frame)
 
-                        crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+                        # Improved Cropping with Padding (5% padding)
+                        pad_w = int((x2 - x1) * 0.05)
+                        pad_h = int((y2 - y1) * 0.05)
+                        px1 = max(0, x1 - pad_w)
+                        py1 = max(0, y1 - pad_h)
+                        px2 = min(w, x2 + pad_w)
+                        py2 = min(h, y2 + pad_h)
+                        
+                        crop = frame[py1:py2, px1:px2]
                         if crop.size > 0:
                             cv2.imwrite(crop_local, crop)
 
