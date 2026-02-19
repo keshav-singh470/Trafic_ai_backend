@@ -324,9 +324,9 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                         cv2.rectangle(highlighted_frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
                         cv2.imwrite(full_local, highlighted_frame)
 
-                        # Improved Cropping with Padding (5% padding)
-                        pad_w = int((x2 - x1) * 0.05)
-                        pad_h = int((y2 - y1) * 0.05)
+                        # Improved Cropping with Padding (12% padding)
+                        pad_w = int((x2 - x1) * 0.12)
+                        pad_h = int((y2 - y1) * 0.12)
                         px1 = max(0, x1 - pad_w)
                         py1 = max(0, y1 - pad_h)
                         px2 = min(w, x2 + pad_w)

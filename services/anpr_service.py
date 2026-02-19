@@ -98,50 +98,51 @@ class ANPRService(BaseTrafficService):
     def clean_plate_text(self, text):
         return re.sub(r'[^A-Z0-9]', '', text.upper())
 
-    def fix_common_ocr_errors(self, text):
+    def position_aware_correct(self, text):
         """
-        Refined Indian plate correction logic.
+        Corrects confusing characters based on Indian plate structure:
+        XX 00 XX 0000 or XX 00 X 0000 or 22 BH 1234 AA
         """
-        if not text:
-            return ""
-            
-        # Common confusions
-        L = {'0':'O','1':'I','5':'S','8':'B','6':'G','2':'Z', '4':'A'}
-        D = {'O':'0','I':'1','L':'1','S':'5','B':'8','G':'6','Z':'2','Q':'0', 'A':'4', 'D':'0'}
+        if not text: return ""
+        
+        # Mapping dictionaries
+        to_L = {'0':'O','1':'I','5':'S','8':'B','6':'G','2':'Z', '4':'A'}
+        to_D = {'O':'0','I':'1','L':'1','S':'5','B':'8','G':'6','Z':'2','Q':'0', 'A':'4', 'D':'0'}
 
         t = list(text)
         length = len(t)
-        
-        # Indian plates usually start with 2 letters (State Code)
+
+        # 1. First 2 characters: ALWAYS LETTERS (State Code)
         for i in range(min(2, length)):
-            if t[i] in L:
-                t[i] = L[t[i]]
+            if t[i] in to_L: t[i] = to_L[t[i]]
+
+        if length >= 4:
+            # 2. Characters 2-3 (District Code): ALWAYS DIGITS
+            for i in range(2, 4):
+                if t[i] in to_D: t[i] = to_D[t[i]]
+            
+            # 3. Last 4 characters: ALWAYS DIGITS
+            for i in range(max(4, length-4), length):
+                if t[i] in to_D: t[i] = to_D[t[i]]
+                
+            # 4. Characters between District and Last Number: ALWAYS LETTERS
+            for i in range(4, length-4):
+                if t[i] in to_L: t[i] = to_L[t[i]]
         
-        # Next 2 are usually digits (District Code)
-        for i in range(2, min(4, length)):
-            if t[i] in D:
-                t[i] = D[t[i]]
-                
-        # Last 4 are always digits
-        for i in range(max(0, length-4), length):
-            if t[i] in D:
-                t[i] = D[t[i]]
-                
-        return ''.join(t)
+        return "".join(t)
 
     def validate_indian_plate(self, text):
-        if not text or len(text) < 7 or len(text) > 12:
+        if not text or len(text) < 7 or len(text) > 11:
             return False
-        # General Standard: XX 00 XX 0000 or XX 00 X 0000
+        # Improved Regex for Standard, BH series, and Old formats
         std = r'^[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{4}$'
-        # BH Series: 22 BH 1234 AA
         bh  = r'^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$'
-        # Old Format: XX 00 0000
         old = r'^[A-Z]{2}[0-9]{1,2}[0-9]{4}$'
         
         return bool(re.match(std, text) or re.match(bh, text) or re.match(old, text))
 
     def extract_indian_plate(self, text):
+        # Look for the pattern within a larger string
         std = r'[A-Z]{2}[0-9]{1,2}[A-Z]{1,3}[0-9]{4}'
         bh  = r'[0-9]{2}BH[0-9]{4}[A-Z]{1,2}'
         old = r'[A-Z]{2}[0-9]{1,2}[0-9]{4}'
@@ -150,6 +151,34 @@ class ANPRService(BaseTrafficService):
             m = re.search(p, text)
             if m: return m.group(0)
         return None
+
+    def calculate_score(self, original, corrected, conf):
+        """
+        Scores a candidate:
+        - Regex match: +100
+        - Length 8-11: +20
+        - Confidence: +10 * conf
+        - Corrections: -5 * penalty
+        """
+        score = 0
+        if not corrected: return -100
+        
+        # Regex check
+        is_valid = self.validate_indian_plate(corrected)
+        if is_valid: score += 100
+        
+        # Length check
+        length = len(corrected)
+        if 8 <= length <= 11: score += 20
+        
+        # Confidence factor
+        score += int(conf * 10)
+        
+        # Penalty for changes (fewer changes = more trust in OCR)
+        diffs = sum(1 for a, b in zip(original, corrected) if a != b)
+        score -= (diffs * 5)
+        
+        return score
 
     # ── Spatial helpers ───────────────────────────────────────
     def _iou(self, a, b):
@@ -203,12 +232,12 @@ class ANPRService(BaseTrafficService):
     def preprocess_for_ocr(self, img, mode='standard'):
         """
         Advanced preprocessing for license plates.
-        Modes: 'standard', 'high_contrast', 'sharpened'
+        Modes: 'standard', 'high_contrast', 'sharpened', 'extreme'
         """
         if img is None or img.size == 0: return None
         
-        # 1. Resize (3x) for better OCR
-        img = cv2.resize(img, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        # 1. Super-Resolution: Resize (4x) for precise OCR
+        img = cv2.resize(img, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
         
         # 2. Grayscale
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
@@ -222,9 +251,14 @@ class ANPRService(BaseTrafficService):
             denoised = cv2.bilateralFilter(gray, 9, 75, 75)
             kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
             processed = cv2.filter2D(denoised, -1, kernel)
+        elif mode == 'extreme':
+            # Binary Thresholding + Dilation for blurry text
+            _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            kernel = np.ones((2,2), np.uint8)
+            processed = cv2.dilate(binary, kernel, iterations=1)
         else: # standard
             # CLAHE (Contrast Enhancement)
-            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
             enhanced = clahe.apply(gray)
             processed = cv2.fastNlMeansDenoising(enhanced, None, 10, 7, 21)
             
@@ -237,10 +271,9 @@ class ANPRService(BaseTrafficService):
                 processed_img, 
                 allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
             )
-        # results = [(bbox, text, conf), ...]
         if not results: return "", 0.0
         
-        full_text = " ".join([r[1] for r in results])
+        full_text = "".join([r[1] for r in results]).replace(" ", "")
         avg_conf = sum([r[2] for r in results]) / len(results)
         return full_text, avg_conf
 
@@ -248,36 +281,50 @@ class ANPRService(BaseTrafficService):
         if plate_img is None or plate_img.size == 0:
             return ""
             
-        best_text = ""
-        max_conf = -1.0
-        
+        candidates = []
         # MULTI-PASS OCR
-        modes = ['standard', 'sharpened', 'high_contrast']
+        modes = ['standard', 'sharpened', 'high_contrast', 'extreme']
         
         for mode in modes:
             processed = self.preprocess_for_ocr(plate_img, mode=mode)
             if processed is None: continue
             
             raw_text, conf = self._ocr_pass(processed)
-            clean_text = self.clean_plate_text(raw_text)
-            clean_text = self.fix_common_ocr_errors(clean_text)
-            extracted  = self.extract_indian_plate(clean_text)
+            if not raw_text: continue
             
-            final_text = extracted if extracted else clean_text
-            is_valid = self.validate_indian_plate(final_text)
+            # Position-Aware Correction
+            corrected = self.position_aware_correct(raw_text)
+            extracted = self.extract_indian_plate(corrected)
+            final_text = extracted if extracted else corrected
             
-            self.log_debug(f"OCR Pass ({mode}): raw='{raw_text}' clean='{final_text}' conf={conf:.2f} valid={is_valid}")
+            # Scoring
+            score = self.calculate_score(raw_text, final_text, conf)
             
-            # If we found a valid plate with decent confidence, we can stop
-            if is_valid and conf > 0.6:
-                return final_text
-                
-            # Otherwise, keep track of the highest confidence result
-            if conf > max_conf:
-                max_conf = conf
-                best_text = final_text
-                
-        return best_text
+            candidates.append({
+                "mode": mode,
+                "raw": raw_text,
+                "final": final_text,
+                "conf": conf,
+                "score": score
+            })
+            
+            # Log all candidates for debugging
+            self.log_debug(f"Candidate ({mode}): raw='{raw_text}' final='{final_text}' score={score} conf={conf:.2f}")
+
+        if not candidates:
+            return ""
+
+        # Sort by score descending
+        candidates.sort(key=lambda x: x["score"], reverse=True)
+        best = candidates[0]
+        
+        # If best score is too low or not regex valid, return low confidence
+        if best["score"] < 100: # 100 is base for regex match
+            self.log_debug(f"⚠️ LOW CONFIDENCE: Best candidate '{best['final']}' score {best['score']}")
+            return "LOW_CONFIDENCE"
+            
+        self.log_debug(f"✅ SELECTED: '{best['final']}' (Pass: {best['mode']}, Score: {best['score']})")
+        return best["final"]
 
     # ── Main detection ────────────────────────────────────────
     def run_detection(self, frame, frame_count):
@@ -333,19 +380,20 @@ class ANPRService(BaseTrafficService):
                     zone["best_plate"]     = None
 
             # ── Collect OCR reading ───────────────────────
-            plate_img  = frame[y1:y2, x1:x2]
-            raw_text   = self.process_plate(plate_img)
-            clean_text = self.clean_plate_text(raw_text)
-            clean_text = self.fix_common_ocr_errors(clean_text)
-            extracted  = self.extract_indian_plate(clean_text)
-            if extracted:
-                clean_text = extracted
-
-            if clean_text:
-                zone["readings"].append(clean_text)
+            # Internal crop with slightly larger padding for OCR (12%)
+            pad_w = int((x2 - x1) * 0.12)
+            pad_h = int((y2 - y1) * 0.12)
+            px1, py1 = max(0, x1 - pad_w), max(0, y1 - pad_h)
+            px2, py2 = min(w, x2 + pad_w), min(h, y2 + pad_h)
+            
+            plate_img = frame[py1:py2, px1:px2]
+            best_plate = self.process_plate(plate_img)
+            
+            if best_plate and best_plate != "LOW_CONFIDENCE":
+                zone["readings"].append(best_plate)
 
             self.log_debug(
-                f"Frame {frame_count}: zone {zone_idx} reading='{clean_text}' "
+                f"Frame {frame_count}: zone {zone_idx} reading='{best_plate}' "
                 f"total_votes={len(zone['readings'])}"
             )
 
