@@ -105,5 +105,5 @@ The system automatically creates these folders when needed:
 ## 🔍 Troubleshooting
 
 - **413 Request Entity Too Large**: Check the `client_max_body_size` in Nginx.
-- **CORS Errors**: Ensure the frontend `API_BASE` matches your backend URL (e.g., `https://ai.ranjeetdev.online`).
+- **CORS Errors**: Ensure the frontend `API_BASE` matches your backend URL (e.g., `http://localhost:8000`).
 - **Memory Errors**: Ensure your server has enough RAM/VRAM for YOLO processing. Use smaller models (e.g., `yolo11n.pt`) for low-memory environments.

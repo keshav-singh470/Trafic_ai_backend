@@ -15,6 +15,7 @@ Include/
 Lib/
 Scripts/
 pyvenv.cfg
+.env
 
 # Models (Track custom models, ignore large generic ones)
 models/

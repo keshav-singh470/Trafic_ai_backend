@@ -309,6 +309,12 @@ class ANPRService(BaseTrafficService):
 
         return to_report
 
+    def reset(self):
+        """Resets the state of the service (tracker and zones)."""
+        print("Resetting ANPRService state (tracker and zones)...")
+        super().reset()
+        self.zones = []
+
     def log_debug(self, message):
         try:
             with open("anpr_debug.log", "a", encoding="utf-8") as f:
