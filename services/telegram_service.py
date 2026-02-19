@@ -12,6 +12,11 @@ BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN")
 CHAT_ID     = os.getenv("TELEGRAM_CHAT_ID")
 API_URL     = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
+if BOT_TOKEN and CHAT_ID:
+    print("✅ Telegram service ready.")
+else:
+    print("⚠️ WARNING: Telegram credentials missing. Alerts will be disabled.")
+
 def create_combined_image(vehicle_path: str, plate_path: str, output_path: str):
     """
     Combines REAL vehicle image and REAL plate crop into a single picture-in-picture image.

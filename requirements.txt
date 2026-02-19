@@ -6,7 +6,6 @@ uvicorn
 python-multipart
 opencv-python
 numpy<2.0.0
-openapi-whisper
 pymongo
 python-dotenv
 dnspython

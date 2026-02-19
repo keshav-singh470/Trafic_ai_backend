@@ -34,7 +34,8 @@ from services.seatbelt_service import SeatbeltService
 from services.s3_service import (
     upload_video as s3_upload_video,
     upload_image as s3_upload_image,
-    get_presigned_url,                   # Updated name
+    upload_file_to_s3,
+    get_presigned_url,
     generate_presigned_urls_for_report,
 )
 from services.telegram_service import send_local_violation, create_combined_image
@@ -59,12 +60,28 @@ app.add_middleware(
 UPLOAD_DIR = "uploads"
 OUTPUT_DIR = "outputs"
 
+# ── Environment Configuration ──────────────────────────────────────────────────
+REQUIRED_ENV_VARS = [
+    "MONGO_URI",
+    "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY",
+    "AWS_S3_BUCKET",
+    "TELEGRAM_BOT_TOKEN",
+    "TELEGRAM_CHAT_ID"
+]
+
+missing_vars = [v for v in REQUIRED_ENV_VARS if not os.getenv(v)]
+if missing_vars:
+    print(f"❌ CRITICAL ERROR: Missing environment variables: {', '.join(missing_vars)}")
+else:
+    print("✅ All required environment variables are set.")
+
 # ── MongoDB ────────────────────────────────────────────────────────────────────
 MONGO_URI = os.getenv("MONGO_URI")
 db = None
 
 if not MONGO_URI:
-    print("CRITICAL ERROR: MONGO_URI not found in environment variables.")
+    print("❌ CRITICAL ERROR: MONGO_URI not found in environment variables.")
 else:
     try:
         client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
@@ -72,7 +89,7 @@ else:
         db = client["ai_traffic_db"]
         print("✅ MongoDB connected successfully")
     except Exception as e:
-        print(f"CRITICAL ERROR: Failed to connect to MongoDB. Error: {e}")
+        print(f"❌ CRITICAL ERROR: Failed to connect to MongoDB. Error: {e}")
 
 # ── Load AI Models once at startup ────────────────────────────────────────────
 print("Loading models once at startup...")
