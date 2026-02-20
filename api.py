@@ -41,7 +41,7 @@ from services.s3_service import (
 from services.telegram_service import send_local_violation, create_combined_image
 from shapely.geometry import Polygon
 
-app = FastAPI(title="Smart Traffic AI - Modular API")
+app = FastAPI(title="3rd AI APP - Traffic AI System")
 
 app.add_middleware(
     CORSMiddleware,
@@ -175,6 +175,9 @@ def save_violation(job_id: str, frame: int, vehicle_id: str, cls: str, plate: st
     if db is None:
         return
     try:
+        # Normalization: Remove whitespace and uppercase
+        plate = plate.strip().upper() if plate else "N/A"
+        
         db.violations.insert_one({
             "job_id":          job_id,
             "frame":           frame,
@@ -627,6 +630,48 @@ def refresh_report_urls(job_id: str):
     # Use the robust helper from s3_service
     refreshed  = generate_presigned_urls_for_report(raw_report)
     return refreshed
+
+
+@app.get("/search")
+def search_plate(plate: str):
+    """
+    Search for violations by number plate.
+    Returns all matching records with presigned URLs.
+    """
+    if not plate:
+        raise HTTPException(status_code=400, detail="Plate parameter is required")
+    
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection not available")
+        
+    try:
+        # Case insensitive regex search on normalized plate
+        query_plate = plate.strip().upper()
+        results = list(db.violations.find({"plate": query_plate}).sort("created_at", -1))
+        
+        # Format for frontend and generate presigned URLs
+        formatted_results = []
+        for r in results:
+            # Map DB fields to consistent frontend keys
+            item = {
+                "Frame": r.get("frame"),
+                "VehicleID": r.get("vehicle_id"),
+                "Type": r.get("class"),
+                "Plate": r.get("plate"),
+                "created_at": r.get("created_at").isoformat() if r.get("created_at") else None,
+                # S3 keys for URL generation
+                "_s3_vehicle_key": r.get("s3_vehicle_key"),
+                "_s3_plate_key": r.get("s3_plate_key"),
+                # Fallbacks
+                "local_evidence": r.get("local_evidence")
+            }
+            formatted_results.append(item)
+            
+        enriched = generate_presigned_urls_for_report(formatted_results)
+        return enriched
+    except Exception as e:
+        print(f"Error in search: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
