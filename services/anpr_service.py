@@ -31,8 +31,13 @@ OCR_LOCK = threading.Lock()
 # ─────────────────────────────────────────────
 
 COOLDOWN_FRAMES  = 600   # ~20s at 30fps – ignore same zone after reporting
-MIN_VOTES_NEEDED = 3     # how many OCR reads before we accept a plate
+MIN_VOTES_NEEDED = 7     # how many OCR reads before we accept a plate (buffer of 10-20 frames)
 SPATIAL_IOU_THRESH = 0.35  # overlap ratio to consider "same vehicle"
+
+INDIAN_STATE_CODES = {
+    "AN", "AP", "AR", "AS", "BR", "CH", "CT", "DN", "DD", "DL", "GA", "GJ", "HR", "HP", "JK", "JH", "KA", "KL", "LA", "LD",
+    "MP", "MH", "MN", "ML", "MZ", "NL", "OD", "PY", "PB", "RJ", "SK", "TN", "TG", "TR", "UP", "UK", "WV", "WB", "BH"
+}
 
 
 class ANPRService(BaseTrafficService):
@@ -102,13 +107,14 @@ class ANPRService(BaseTrafficService):
         """
         Corrects confusing characters based on Indian plate structure:
         XX 00 XX 0000 or XX 00 X 0000 or 22 BH 1234 AA
+        Common OCR mistakes: M↔H, 0↔O, 5↔S, 8↔B, 1↔I
         """
         if not text: return ""
         
         # Mapping dictionaries
-        to_L = {'0':'O','1':'I','5':'S','8':'B','6':'G','2':'Z', '4':'A'}
-        to_D = {'O':'0','I':'1','L':'1','S':'5','B':'8','G':'6','Z':'2','Q':'0', 'A':'4', 'D':'0'}
-
+        to_L = {'0':'O','1':'I','5':'S','8':'B','6':'G','2':'Z', '4':'A', '5':'S'}
+        to_D = {'O':'0','I':'1','L':'1','S':'5','B':'8','G':'6','Z':'2','Q':'0', 'A':'4', 'D':'0', 'H': 'H', 'M': 'M'}
+        
         t = list(text)
         length = len(t)
 
@@ -126,17 +132,14 @@ class ANPRService(BaseTrafficService):
                 if t[i] in to_D: t[i] = to_D[t[i]]
                 
             # 4. Characters between District and Last Number: ALWAYS LETTERS
-            # Handles BOTH XX 00 X 0000 and XX 00 XX 0000 formats
             for i in range(4, length-4):
                 if t[i] in to_L: t[i] = to_L[t[i]]
-                # Special mapping for L to 1 is handled in to_D for digit areas, 
-                # but in letter area L is already correct.
         
         return "".join(t)
 
     def validate_indian_plate(self, text):
         """
-        Hard rule: Must be exactly 9 or 10 characters and match regex.
+        Hard rule: Must match Indian plate format and have valid state code.
         """
         if not text: return False
         
@@ -144,9 +147,15 @@ class ANPRService(BaseTrafficService):
         if length not in [9, 10]:
             return False
 
+        # State code check (first 2 chars)
+        state_code = text[:2]
+        if state_code not in INDIAN_STATE_CODES:
+            # Try to see if it's a BH plate (BH is already in INDIAN_STATE_CODES, but might be at index 2)
+            if not (length == 10 and text[2:4] == "BH"):
+                return False
+
         # XX 00 X 0000 (9) or XX 00 XX 0000 (10)
         std = r'^[A-Z]{2}[0-9]{2}[A-Z]{1,2}[0-9]{4}$'
-        # Note: BH and Old formats usually don't fit 9 or 10 strictly but we follow requested rule.
         # BH: 22BH1234AA (10)
         bh = r'^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$'
         
@@ -216,63 +225,88 @@ class ANPRService(BaseTrafficService):
     def _best_vote(self, readings):
         """
         From a list of OCR strings, return the most-common valid plate.
-        Falls back to fuzzy grouping if no single text wins.
+        If no consensus after many readings, returns 'Unreadable'.
         """
+        if not readings: return None
+        
         valid = [r for r in readings if self.validate_indian_plate(r)]
         if valid:
             winner, count = Counter(valid).most_common(1)[0]
-            if count >= 1:
+            # Require at least 30% of valid readings to agree for stability
+            if count >= max(2, len(valid) * 0.3):
                 return winner
 
-        # Fuzzy group all readings
-        groups = {}
-        for r in readings:
-            placed = False
-            for key in groups:
-                if SequenceMatcher(None, r, key).ratio() > 0.72:
-                    groups[key].append(r)
-                    placed = True
-                    break
-            if not placed:
-                groups[r] = [r]
-
-        if not groups:
-            return None
-
-        best_group = max(groups.values(), key=len)
-        candidate, _ = Counter(best_group).most_common(1)[0]
-        return candidate if self.validate_indian_plate(candidate) else None
+        # If we have a lot of readings but no clear valid winner
+        if len(readings) >= MIN_VOTES_NEEDED:
+            # Try fuzzy grouping
+            groups = {}
+            for r in readings:
+                placed = False
+                for key in groups:
+                    if SequenceMatcher(None, r, key).ratio() > 0.8:
+                        groups[key].append(r)
+                        placed = True
+                        break
+                if not placed:
+                    groups[r] = [r]
+            
+            best_group = max(groups.values(), key=len)
+            candidate, count = Counter(best_group).most_common(1)[0]
+            
+            # If the best fuzzy group is small and we have many attempts, mark unreadable
+            if count < 3 and len(readings) > 15:
+                return "Unreadable"
+                
+            return candidate if self.validate_indian_plate(candidate) else "Unreadable"
+            
+        return None
 
     # ── OCR ───────────────────────────────────────────────────
     def preprocess_for_ocr(self, img, mode='standard'):
         """
         Advanced preprocessing for license plates.
-        Modes: 'standard', 'high_contrast', 'sharpened', 'extreme'
+        Modes: 'standard', 'improved', 'high_contrast', 'sharpened', 'extreme'
         """
         if img is None or img.size == 0: return None
         
-        # 1. Super-Resolution: Resize (4x) for precise OCR
+        # ── mode: improved (User Requested Sequence) ──────────────────────────
+        if mode == 'improved':
+            # 1. Grayscale
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            
+            # 2. Resize (3x Scaling)
+            resized = cv2.resize(gray, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+            
+            # 3. Noise removal (Gaussian Blur)
+            blurred = cv2.GaussianBlur(resized, (5, 5), 0)
+            
+            # 4. Thresholding (Otsu)
+            _, thresholded = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            
+            # 5. Sharpening
+            kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+            processed = cv2.filter2D(thresholded, -1, kernel)
+            return processed
+
+        # ── Other modes ───────────────────────────────────────────────────────
+        # 1. Super-Resolution (Default for other modes)
         img = cv2.resize(img, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
         
         # 2. Grayscale
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
         if mode == 'high_contrast':
-            # Adaptive Thresholding for tough lighting
             processed = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
                                              cv2.THRESH_BINARY, 11, 2)
         elif mode == 'sharpened':
-            # Bilateral Filter (Noise Reduction) + Sharpen
             denoised = cv2.bilateralFilter(gray, 9, 75, 75)
             kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
             processed = cv2.filter2D(denoised, -1, kernel)
         elif mode == 'extreme':
-            # Binary Thresholding + Dilation for blurry text
             _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
             kernel = np.ones((2,2), np.uint8)
             processed = cv2.dilate(binary, kernel, iterations=1)
         else: # standard
-            # CLAHE (Contrast Enhancement)
             clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
             enhanced = clahe.apply(gray)
             processed = cv2.fastNlMeansDenoising(enhanced, None, 10, 7, 21)
@@ -295,11 +329,11 @@ class ANPRService(BaseTrafficService):
     def process_plate(self, plate_img, modes=None):
         if plate_img is None or plate_img.size == 0:
             return ""
-            
+
         candidates = []
         # Fallback to default modes if none provided
         if modes is None:
-            modes = ['standard', 'sharpened', 'high_contrast']
+            modes = ['improved', 'standard', 'sharpened']
         
         for mode in modes:
             processed = self.preprocess_for_ocr(plate_img, mode=mode)
@@ -313,18 +347,23 @@ class ANPRService(BaseTrafficService):
             extracted = self.extract_indian_plate(corrected)
             final_text = extracted if extracted else corrected
             
-            # Scoring
-            score = self.calculate_score(raw_text, final_text, conf)
+            # ── [NEW] Common Character Swap Attempt (M ↔ H, etc.) ────────
+            # If the current best isn't great, try swapping common mistakes
+            alternate_texts = [final_text]
+            if "H" in final_text: alternate_texts.append(final_text.replace("H", "M"))
+            if "M" in final_text: alternate_texts.append(final_text.replace("M", "H"))
             
-            candidates.append({
-                "mode": mode,
-                "raw": raw_text,
-                "final": final_text,
-                "conf": conf,
-                "score": score
-            })
+            for text_variant in set(alternate_texts):
+                score = self.calculate_score(raw_text, text_variant, conf)
+                candidates.append({
+                    "mode": mode,
+                    "raw": raw_text,
+                    "final": text_variant,
+                    "conf": conf,
+                    "score": score
+                })
             
-            self.log_debug(f"Candidate ({mode}): raw='{raw_text}' final='{final_text}' score={score} conf={conf:.2f}")
+            self.log_debug(f"Candidate variants for mode {mode}: {alternate_texts}")
 
         if not candidates:
             return ""
@@ -393,37 +432,44 @@ class ANPRService(BaseTrafficService):
                     zone["reported_frame"] = -1
                     zone["best_plate"]     = None
 
-            # ── 1. First OCR Attempt (12% padding) ──────────
-            pad1 = int((x2 - x1) * 0.12)
-            px1, py1 = max(0, x1 - pad1), max(0, y1 - pad1)
-            px2, py2 = min(w, x2 + pad1), min(h, y2 + pad1)
-            
-            plate_img1 = frame[py1:py2, px1:px2]
-            best_plate = self.process_plate(plate_img1, modes=['standard', 'sharpened', 'high_contrast'])
-            
-            # ── 2. Retry Attempt (25% padding + Extreme) ─────
-            if not best_plate or best_plate == "LOW_CONFIDENCE":
-                self.log_debug(f"Frame {frame_count}: Retry OCR with 25% padding and extreme mode...")
-                pad2 = int((x2 - x1) * 0.25)
-                rx1, ry1 = max(0, x1 - pad2), max(0, y1 - pad2)
-                rx2, ry2 = min(w, x2 + pad2), min(h, y2 + pad2)
-                
-                plate_img2 = frame[ry1:ry2, rx1:rx2]
-                best_plate = self.process_plate(plate_img2, modes=['extreme'])
+            # ── 1. Advanced Crop with Padding & Min-Size ──────────────────
+            # Lower confidence filter for better recall (0.25)
+            if float(box.conf[0]) < 0.25: continue
 
+            # Add 10% padding
+            pw = (x2 - x1) * 0.10
+            ph = (y2 - y1) * 0.10
+            px1, py1 = max(0, int(x1 - pw)), max(0, int(y1 - ph))
+            px2, py2 = min(w, int(x2 + pw)), min(h, int(y2 + ph))
+            
+            plate_img = frame[py1:py2, px1:px2]
+            
+            # Minimum size check (120x40)
+            ch, cw = plate_img.shape[:2]
+            if cw < 120 or ch < 40:
+                scale_w = 120 / cw if cw > 0 else 1
+                scale_h = 40 / ch if ch > 0 else 1
+                scale = max(scale_w, scale_h)
+                plate_img = cv2.resize(plate_img, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
+            # ── 2. Run OCR with Multi-mode Enhancement ──────────────────
+            best_plate = self.process_plate(plate_img, modes=['improved', 'standard', 'sharpened', 'extreme'])
+            
             if best_plate and best_plate != "LOW_CONFIDENCE":
                 zone["readings"].append(best_plate)
+                # Keep buffer to last 20 readings
+                if len(zone["readings"]) > 20:
+                    zone["readings"] = zone["readings"][-20:]
 
             self.log_debug(
                 f"Frame {frame_count}: zone {zone_idx} outcome='{best_plate}' "
-                f"total_votes={len(zone['readings'])}"
+                f"buffer_size={len(zone['readings'])}"
             )
 
-            # ── Not enough votes yet ──────────────────────
+            # ── 3. Vote and Confidence Check ────────────────────────────
             if len(zone["readings"]) < MIN_VOTES_NEEDED:
                 continue
 
-            # ── Vote for best plate ───────────────────────
             best = self._best_vote(zone["readings"])
             if not best:
                 continue
