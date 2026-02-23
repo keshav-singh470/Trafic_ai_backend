@@ -16,13 +16,19 @@ os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"]   = "python"
 os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"]    = "True"
 os.environ["GLOG_minloglevel"]                         = "2"
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks, Form, Body
+from pydantic import BaseModel
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import shutil
 import uuid
 import cv2
+import json
+import numpy as np
+import threading
+import re
+import contextlib
 from typing import Dict, List
 
 from services.anpr_service import ANPRService
@@ -39,9 +45,34 @@ from services.s3_service import (
     generate_presigned_urls_for_report,
 )
 from services.telegram_service import send_local_violation, create_combined_image
+from services.pdf_service import generate_violation_pdf
 from shapely.geometry import Polygon
+from openai import OpenAI
 
-app = FastAPI(title="3rd AI APP - Traffic AI System")
+VEHICLE_TYPES = ["car", "bike", "bus", "truck", "auto", "cycle", "pedestrian", "unknown"]
+VEHICLE_COLORS = ["red", "blue", "white", "black", "silver", "unknown"]
+
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Create indexes for optimized search
+    if db is not None:
+        try:
+            db.detections.create_index([("plate_text", 1)])
+            db.detections.create_index([("vehicle_type", 1)])
+            db.detections.create_index([("vehicle_color", 1)])
+            db.detections.create_index([("violation_type", 1)])
+            db.detections.create_index([("created_at", -1)])
+            db.detections.create_index([("job_id", 1)])
+            print("✅ MongoDB Indexes updated.")
+        except Exception as e:
+            print(f"Index error: {e}")
+    yield
+    # Shutdown logic (if any) could go here
+
+app = FastAPI(title="3rd AI APP - Traffic AI System", lifespan=lifespan)
+
+# Groq Client (Removed as per request)
+GROQ_CLIENT = None
 
 app.add_middleware(
     CORSMiddleware,
@@ -138,8 +169,8 @@ def create_job_in_db(job_id: str, case_type: str, s3_video_key: str):
     try:
         db.jobs.insert_one({
             "job_id":        job_id,
+            "video_url":     s3_video_key,   # Store S3 key as requested (can be converted to URL)
             "case_type":     case_type,
-            "s3_video_key":  s3_video_key,   # ← S3 key stored here
             "status":        "pending",
             "violation_count": 0,
             "created_at":    datetime.now(timezone.utc),
@@ -148,49 +179,118 @@ def create_job_in_db(job_id: str, case_type: str, s3_video_key: str):
         print(f"ERROR creating job in MongoDB: {e}")
 
 
-def update_job_in_db(job_id: str, status: str, violation_count: int):
+def update_job_in_db(job_id: str, status: str, violation_count: int, error_message: str = None):
     if db is None:
         return
     try:
+        update_data = {
+            "status":          status,
+            "violation_count": violation_count,
+            "completed_at":    datetime.now(timezone.utc),
+        }
+        if error_message:
+            update_data["error_message"] = error_message
+            
         db.jobs.update_one(
             {"job_id": job_id},
-            {"$set": {
-                "status":          status,
-                "violation_count": violation_count,
-                "completed_at":    datetime.now(timezone.utc),
-            }}
+            {"$set": update_data}
         )
     except Exception as e:
         print(f"ERROR updating job in MongoDB: {e}")
 
 
-def save_violation(job_id: str, frame: int, vehicle_id: str, cls: str, plate: str,
-                   s3_vehicle_key: str = None, s3_plate_key: str = None,
-                   local_evidence_url: str = None):
+def save_detection(job_id: str, frame: int, vehicle_id: str, 
+                   plate: str, confidence: float = 0.0, status: str = "low_confidence",
+                   violation_type: str = "N/A", vehicle_type: str = "unknown",
+                   vehicle_color: str = "unknown", s3_vehicle_key: str = None, 
+                   s3_plate_key: str = None, fps: float = 30.0, raw_ocr: str = None):
     """
-    Save violation to MongoDB.
-    Stores S3 keys (not URLs) for vehicle_image and plate_image.
-    local_evidence_url is the fallback /outputs/... path.
+    Phase 2: Save to 'vehicles' collection with Plate-based De-duplication.
+    Strict Schema: job_id, plate_number, vehicle_type, color, timestamp, frame_number, violations, images.
     """
-    if db is None:
-        return
+    if db is None: return
     try:
-        # Normalization: Remove whitespace and uppercase
-        plate = plate.strip().upper() if plate else "N/A"
+        total_seconds = int(frame / fps)
+        time_str = f"{total_seconds // 3600:02d}:{(total_seconds % 3600) // 60:02d}:{total_seconds % 60:02d}"
+
+        # Clean plate
+        plate_number = plate.strip().upper() if plate and plate != "N/A" else "N/A"
         
-        db.violations.insert_one({
-            "job_id":          job_id,
-            "frame":           frame,
-            "vehicle_id":      vehicle_id,
-            "class":           cls,
-            "plate":           plate,
-            "s3_vehicle_key":  s3_vehicle_key,   # ← S3 key
-            "s3_plate_key":    s3_plate_key,      # ← S3 key
-            "local_evidence":  local_evidence_url,
-            "created_at":      datetime.now(timezone.utc),
-        })
+        from difflib import SequenceMatcher
+        
+        # Primary Key: vehicle_id (Tracking ID) within a job
+        # If vehicle_id is N/A, fallback to fuzzy plate matching
+        filter_query = {"job_id": job_id}
+        existing = None
+        
+        if vehicle_id and vehicle_id != "N/A":
+            filter_query["vehicle_id"] = vehicle_id
+            existing = db.vehicles.find_one(filter_query)
+        
+        # Always check for plate-based fuzzy matching to prevent duplicates even if tracker flips
+        if not existing and plate_number != "N/A":
+            # Attempt Fuzzy Search for existing plate in same job
+            # We look for a highly similar plate that was detected recently (frame-wise) or globally in job
+            similar_plates = db.vehicles.find({"job_id": job_id, "plate_number": {"$ne": "N/A"}})
+            for sp in similar_plates:
+                similarity = SequenceMatcher(None, plate_number, sp["plate_number"]).ratio()
+                if similarity > 0.8: # Strict similarity to avoid merging different vehicles
+                    existing = sp
+                    filter_query = {"_id": sp["_id"]}
+                    break
+            
+            # If still not found by fuzzy, try exact
+            if not existing:
+                filter_query = {"job_id": job_id, "plate_number": plate_number}
+                existing = db.vehicles.find_one(filter_query)
+        elif not vehicle_id or vehicle_id == "N/A":
+            # If no vehicle ID and no plate, it's likely a generic violation or low-confidence noise
+            filter_query["vehicle_id"] = "N/A"
+            filter_query["plate_number"] = "N/A"
+            existing = db.vehicles.find_one(filter_query)
+        if existing:
+            # If we already have a high-confidence plate, don't overwrite it with a lower-confidence eager one
+            if existing.get("status") == "verified" and status != "verified":
+                if raw_ocr:
+                    db.vehicles.update_one(filter_query, {"$push": {"raw_ocr_candidates": raw_ocr}})
+                return
+            
+            # Tie-break: if new confidence is lower, don't overwrite the plate text/images
+            if existing.get("confidence", 0.0) > confidence:
+                if raw_ocr:
+                    db.vehicles.update_one(filter_query, {"$push": {"raw_ocr_candidates": raw_ocr}})
+                return
+
+        update_data = {
+            "$set": {
+                "vehicle_id":        vehicle_id,
+                "plate_number":      plate_number,
+                "vehicle_type":      vehicle_type,
+                "color":             vehicle_color,
+                "timestamp":         time_str,
+                "frame_number":      int(frame),
+                "confidence":        float(confidence),
+                "status":            status,
+                "updated_at":        datetime.now(timezone.utc),
+            },
+            "$addToSet": {
+                "violations":        violation_type.upper() if violation_type else "ANPR"
+            },
+            "$setOnInsert": {
+                "job_id":            job_id,
+                "created_at":        datetime.now(timezone.utc),
+            }
+        }
+
+        if s3_plate_key:   update_data["$set"]["plate_image_url"]   = s3_plate_key
+        if s3_vehicle_key: update_data["$set"]["vehicle_image_url"] = s3_vehicle_key
+        if raw_ocr:        update_data.setdefault("$push", {})["raw_ocr_candidates"] = raw_ocr
+
+        db.vehicles.update_one(filter_query, update_data, upsert=True)
+        print(f"✅ Vehicle record synced: {plate_number} | {status}")
+        
     except Exception as e:
-        print(f"ERROR saving violation to MongoDB: {e}")
+        print(f"ERROR saving to 'vehicles': {e}")
 
 
 def calculate_iou(boxA, boxB):
@@ -208,10 +308,20 @@ def calculate_iou(boxA, boxB):
 
 def process_video_task(job_id: str, input_path: str, output_path: str,
                        case_type: str, s3_video_key: str = None):
-    try:
-        print(f">>> Job started: {job_id} | type={case_type}")
+    print(f"[JOB {job_id}] Starting background task | type={case_type}")
+    
+    # 1. Update job status to processing
+    if job_id in jobs:
         jobs[job_id]["status"] = "processing"
-
+    update_job_in_db(job_id, "processing", 0)
+    
+    cap = None
+    out = None
+    violation_count = 0
+    # Track sent alerts to ensure one alert per unique plate per job (URGENT)
+    sent_alerts = set()
+    
+    try:
         # Select service
         if case_type in ["anpr", "security", "blacklist"]:
             service = ANPR_SERVICE
@@ -233,36 +343,35 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
             service.reset()
 
         cap = cv2.VideoCapture(input_path)
+        if not cap.isOpened():
+            raise Exception(f"Failed to open video: {input_path}")
+            
         w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
-        codecs = [('mp4v', 'mp4'), ('XVID', 'avi'), ('MJPG', 'avi'), ('DIVX', 'avi')]
-        out = None
+        # VideoWriter Setup
+        codecs = [('mp4v', 'mp4'), ('XVID', 'avi')]
         final_output_path = output_path
-
         for codec, ext in codecs:
             try:
-                current_ext = final_output_path.split('.')[-1]
-                if ext != current_ext:
-                    base = os.path.splitext(output_path)[0]
-                    final_output_path = f"{base}.{ext}"
-                fourcc   = cv2.VideoWriter_fourcc(*codec)
-                temp_out = cv2.VideoWriter(final_output_path, fourcc, fps, (w, h))
+                base = os.path.splitext(output_path)[0]
+                temp_path = f"{base}.{ext}"
+                fourcc = cv2.VideoWriter_fourcc(*codec)
+                temp_out = cv2.VideoWriter(temp_path, fourcc, int(fps), (w, h))
                 if temp_out.isOpened():
-                    print(f"VideoWriter: codec={codec} → {final_output_path}")
-                    out         = temp_out
-                    output_path = final_output_path
+                    out = temp_out
+                    output_path = temp_path
                     break
-            except Exception as e:
-                print(f"Codec {codec} failed: {e}")
+            except Exception:
+                continue
 
-        if not out or not out.isOpened():
-            raise Exception("Failed to initialize VideoWriter with any codec")
+        if not out:
+            raise Exception("Failed to initialize VideoWriter")
 
-        frame_count         = 0
+        frame_count = 0
         reported_violations = []
-        assets_dir          = os.path.join(OUTPUT_DIR, "assets")
+        assets_dir = os.path.join(OUTPUT_DIR, "assets")
 
         while cap.isOpened():
             ret, frame = cap.read()
@@ -270,270 +379,218 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                 break
             frame_count += 1
 
-            # ── ANPR / Security / Blacklist ────────────────────────────────
             if case_type in ["anpr", "security", "blacklist"]:
+                # Get tracked objects for vehicle matching first
                 _, tracked = service.process_frame(frame)
                 
-                # Update stability early in the loop
-                if hasattr(service, "update_stability"):
-                    service.update_stability(tracked.tracker_id)
+                all_detections, to_report = service.run_detection(frame, frame_count)
                 
-                results    = service.run_detection(frame, frame_count)
+                # Draw raw detections for debugging/output video
+                for det in all_detections:
+                    b = det["box"]
+                    text = f"{det['text']} ({det['conf']:.2f})"
+                    cv2.rectangle(frame, (b[0], b[1]), (b[2], b[3]), (255, 0, 0), 2)
+                    cv2.putText(frame, text, (b[0], b[1]-10), 0, 0.5, (255, 0, 0), 2)
 
-                for res in results:
-                    is_alert = res.get("alert", False)
-                    if case_type in ["security", "blacklist"] and not is_alert:
-                        continue
-
-                    pcx   = (res["box"][0] + res["box"][2]) / 2
-                    pcy   = (res["box"][1] + res["box"][3]) / 2
-                    owner = "N/A"
+                for res in to_report:
+                    # Find matching vehicle ID for mapping
+                    pcx = (res["box"][0] + res["box"][2]) / 2
+                    pcy = (res["box"][1] + res["box"][3]) / 2
                     vehicle_tid = None
-                    for tid, vbox in zip(tracked.tracker_id, tracked.xyxy):
-                        if vbox[0] <= pcx <= vbox[2] and vbox[1] <= pcy <= vbox[3]:
-                            owner = f"V-{tid}"
-                            vehicle_tid = tid
-                            break
+                    v_type = "unknown"
+                    v_color = "unknown"
+                    
+                    if tracked is not None and hasattr(tracked, 'tracker_id'):
+                        for i in range(len(tracked.tracker_id)):
+                            tid = tracked.tracker_id[i]
+                            vbox = tracked.xyxy[i]
+                            if vbox[0] <= pcx <= vbox[2] and vbox[1] <= pcy <= vbox[3]:
+                                vehicle_tid = tid
+                                cls_id = tracked.class_id[i]
+                                v_type = VEHICLE_TYPES[int(cls_id)] if int(cls_id) < len(VEHICLE_TYPES) else "unknown"
+                                break
 
-                    if res.get("is_new", True):
-                        # Apply de-duplication and stability rules BEFORE saving and alerting
-                        if vehicle_tid is not None:
-                            if not service.should_alert(vehicle_tid, res["text"]):
-                                continue
-                        else:
-                            # Skip if no track_id associated (requirement for track-based de-dup)
-                            print(f"   [SKIP] Plate {res['text']} detected but no associated track ID found.")
-                            continue
-                        msg_type = "SECURITY ALERT" if is_alert else "ANPR"
+                    print(f"🔍 Plate detected: {res['text']} (conf={res['conf']:.2f})")
+                    
+                    assets_id = uuid.uuid4().hex[:8]
+                    full_name  = f"anpr_{assets_id}.jpg"
+                    crop_name  = f"anpr_crop_{assets_id}.jpg"
+                    full_local = os.path.join(assets_dir, full_name)
+                    crop_local = os.path.join(assets_dir, crop_name)
 
-                        if is_alert:
-                            b = res["box"]
-                            cv2.rectangle(frame, (b[0], b[1]), (b[2], b[3]), (0, 0, 255), 2)
-                            cv2.putText(frame, f"{res['text']} [ALERT]",
-                                        (b[0], b[1]-10), 0, 0.6, (0, 0, 255), 2)
+                    # Save Full Vehicle Image
+                    highlighted_frame = frame.copy()
+                    b = res["box"]
+                    cv2.rectangle(highlighted_frame, (b[0], b[1]), (b[2], b[3]), (0, 255, 0), 3)
+                    cv2.imwrite(full_local, highlighted_frame)
+                    
+                    # ── Phase 1: High Quality Plate Crop (Tight Padding) ──
+                    # User requested "same to same" cropping, so we reduce padding
+                    bw, bh_crop = b[2]-b[0], b[3]-b[1]
+                    pad_w, pad_h = int(bw * 0.05), int(bh_crop * 0.05)
+                    x1_pad = max(0, b[0] - pad_w)
+                    y1_pad = max(0, b[1] - pad_h)
+                    x2_pad = min(w, b[2] + pad_w)
+                    y2_pad = min(h, b[3] + pad_h)
+                    
+                    crop = frame[y1_pad:y2_pad, x1_pad:x2_pad]
+                    if crop.size > 0:
+                        ch, cw = crop.shape[:2]
+                        if cw < 120 or ch < 40:
+                            # Upscale to min size (Phase 1)
+                            new_w = max(120, cw)
+                            new_h = max(40, ch)
+                            crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+                        cv2.imwrite(crop_local, crop)
+                    else:
+                        cv2.imwrite(crop_local, frame[b[1]:b[3], b[0]:b[2]])
 
-                        check_dirs()
-                        assets_id = uuid.uuid4().hex[:8]
-                        full_name  = f"anpr_{assets_id}.jpg"
-                        crop_name  = f"anpr_crop_{assets_id}.jpg"
-                        full_local = os.path.join(assets_dir, full_name)
-                        crop_local = os.path.join(assets_dir, crop_name)
+                    # Upload to S3
+                    full_s3_key = s3_upload_image(full_local, f"evidence/{full_name}")
+                    crop_s3_key = s3_upload_image(crop_local, f"evidence/{crop_name}")
 
-                        # Highlight the plate on the full image with a parrot-green box
-                        highlighted_frame = frame.copy()
-                        b = res["box"]
-                        x1, y1, x2, y2 = b
-                        # Parrot-Green: (0, 255, 0), thickness: 3
-                        cv2.rectangle(highlighted_frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
-                        cv2.imwrite(full_local, highlighted_frame)
-
-                        # Improved Cropping with Padding (12% padding)
-                        pad_w = int((x2 - x1) * 0.12)
-                        pad_h = int((y2 - y1) * 0.12)
-                        px1 = max(0, x1 - pad_w)
-                        py1 = max(0, y1 - pad_h)
-                        px2 = min(w, x2 + pad_w)
-                        py2 = min(h, y2 + pad_h)
-                        
-                        crop = frame[py1:py2, px1:px2]
-                        if crop.size > 0:
-                            cv2.imwrite(crop_local, crop)
-
-                        # Upload to S3 — get KEYS back
-                        full_s3_key = s3_upload_image(full_local, f"evidence/{full_name}")
-                        crop_s3_key = s3_upload_image(crop_local, f"evidence/{crop_name}")
-
-                        # Local fallback URLs
-                        full_local_url = f"/outputs/assets/{full_name}"
-                        crop_local_url = f"/outputs/assets/{crop_name}"
-
-                        # Generate presigned URLs for current report display
-                        full_presigned = get_presigned_url(full_s3_key) if full_s3_key else full_local_url
-                        crop_presigned = get_presigned_url(crop_s3_key) if crop_s3_key else crop_local_url
-
-                        formatted = {
-                            "Frame":            int(frame_count),
-                            "VehicleID":        owner,
-                            "Type":             msg_type,
-                            "Plate":            res["text"],
-                            "extracted_number": res["text"],
-                            # Presigned URLs for frontend display
-                            "vehicle_image":    full_presigned,
-                            "plate_image":      crop_presigned,
-                            "FullImgUrl":       full_presigned,
-                            "CropImgUrl":       crop_presigned,
-                            # S3 keys stored for re-generating URLs later
-                            "_s3_vehicle_key":  full_s3_key,
-                            "_s3_plate_key":    crop_s3_key,
-                        }
-                        jobs[job_id]["report"].append(formatted)
-
-                        # ── Inline Telegram Alert (Synchronized) ──
-                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        violation_number = len(jobs[job_id]["report"])
-                        combined_path = os.path.join(OUTPUT_DIR, f"alert_{job_id}_{violation_number}.jpg")
-                        
-                        print(f"🎨 Composing PIP alert for Job {job_id} [ANPR]...")
-                        if create_combined_image(full_local, crop_local, combined_path):
-                            send_local_violation(
-                                combined_path=combined_path,
-                                plate_text=res["text"],
-                                job_id=job_id,
-                                case_type=case_type,
-                                violation_count=len(jobs[job_id]["report"]),
-                                status="Processing",
-                                timestamp=timestamp
-                            )
-                            # Mark as alerted to prevent duplicates
-                            service.mark_alerted(vehicle_tid, res["text"])
-
-                        # MongoDB — store S3 keys
-                        save_violation(
+                    # Phase 1: Relaxed Gate 0.85
+                    # Phase 1: Relaxed Gate 0.2 (URGENT)
+                    status = "verified" if res["conf"] >= 0.2 else "low_confidence"
+                    
+                    plate_cleanup = res["text"].strip().upper()
+                    
+                    # ── SAVING LOGIC ──
+                    if res.get("verified_candidate"):
+                        # Save result
+                        save_detection(
                             job_id=job_id,
-                            frame=int(frame_count),
-                            vehicle_id=str(owner),
-                            cls=str(msg_type),
-                            plate=str(res["text"]),
+                            frame=frame_count,
+                            vehicle_id=str(vehicle_tid) if vehicle_tid is not None else "N/A",
+                            plate=res["text"],
+                            confidence=res["conf"],
+                            status=status,
+                            violation_type="ANPR",
+                            vehicle_type=v_type,
+                            vehicle_color=v_color,
                             s3_vehicle_key=full_s3_key,
                             s3_plate_key=crop_s3_key,
-                            local_evidence_url=full_local_url,
+                            fps=fps
                         )
-
-                    if not res.get("alert", False):
-                        b     = res["box"]
-                        color = (0, 255, 0) if res.get("is_new", True) else (0, 255, 255)
-                        cv2.rectangle(frame, (b[0], b[1]), (b[2], b[3]), color, 2)
-                        cv2.putText(frame, res["text"], (b[0], b[1]-10), 0, 0.6, color, 2)
+                        
+                        violation_count += 1
+                        
+                        # ── TELEGRAM ALERT LOGIC (Unique per Tracking ID or Plate - UNREPEATED) ──
+                        # Only alert for VERIFIED (Stable) results to ensure accuracy and no-miss
+                        # Added check for minimum length (9-10) to avoid sending bad OCR results
+                        alert_id = str(vehicle_tid) if vehicle_tid is not None else f"plate_{plate_cleanup}"
+                        is_valid_plate = len(plate_cleanup) >= 9
+                        
+                        if res.get("verified_candidate") and alert_id not in sent_alerts and is_valid_plate:
+                            sent_alerts.add(alert_id)
+                            timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            combined_path = os.path.join(OUTPUT_DIR, f"alert_{job_id}_{frame_count}.jpg")
+                            
+                            if create_combined_image(full_local, crop_local, combined_path):
+                                send_local_violation(
+                                    combined_path=combined_path,
+                                    plate_text=res["text"],
+                                    job_id=job_id,
+                                    case_type=case_type,
+                                    violation_count=violation_count,
+                                    status="Verified" if res["conf"] >= 0.2 else "Low Confidence",
+                                    timestamp=timestamp_now
+                                )
+                                print(f"✈️ Telegram alert sent for unique detection: {res['text']} (conf={res['conf']:.2f})")
 
             # ── Other violation types ──────────────────────────────────────
             else:
                 _, tracked = service.process_frame(frame)
-                if hasattr(service, "update_stability"):
-                    service.update_stability(tracked.tracker_id)
-
                 violations = service.run_detection(frame)
 
                 for v in violations:
-                    # De-duplication check for other violations
-                    # (Note: many services return track_id in v["id"])
                     if not service.should_alert(v["id"], "N/A"):
                         continue
+                    
                     is_duplicate = False
                     for rv in reported_violations:
                         if rv["id"] == v["id"] and rv["type"] == v["type"]:
                             is_duplicate = True
                             break
-                    if not is_duplicate:
-                        for rv in reported_violations:
-                            if rv["type"] == v["type"]:
-                                iou = calculate_iou(v["box"], rv["box"])
-                                if iou > 0.5 and frame_count - rv["frame"] < 1000:
-                                    is_duplicate = True
-                                    break
-                    if is_duplicate:
-                        continue
+                    if is_duplicate: continue
 
                     reported_violations.append({
                         "id": v["id"], "box": v["box"],
                         "type": v["type"], "frame": frame_count,
                     })
+                    violation_count += 1
 
+                    assets_id = uuid.uuid4().hex[:8]
+                    full_name  = f"violation_{assets_id}.jpg"
+                    crop_name  = f"violation_crop_{assets_id}.jpg"
+                    full_local = os.path.join(assets_dir, full_name)
+                    crop_local = os.path.join(assets_dir, crop_name)
+
+                    # Highlight the violation
+                    highlighted_frame = frame.copy()
                     b = v["box"]
-                    cv2.rectangle(frame, (b[0], b[1]), (b[2], b[3]), (0, 0, 255), 2)
-                    cv2.putText(frame, v["type"], (b[0], b[1]-10), 0, 0.6, (0, 0, 255), 2)
+                    cv2.rectangle(highlighted_frame, (b[0], b[1]), (b[2], b[3]), (0, 0, 255), 3)
+                    cv2.putText(highlighted_frame, v["type"], (b[0], b[1]-10), 0, 0.7, (0, 0, 255), 2)
+                    cv2.imwrite(full_local, highlighted_frame)
 
-                    formatted = {
-                        "Frame":            int(frame_count),
-                        "VehicleID":        f"V-{v['id']}",
-                        "Type":             v["type"],
-                        "Plate":            "VIOLATION",
-                        "extracted_number": "N/A",
-                        "vehicle_image":    None,
-                        "plate_image":      None,
-                        "_s3_vehicle_key":  None,
-                        "_s3_plate_key":    None,
-                    }
+                    crop = frame[max(0, b[1]):min(h, b[3]), max(0, b[0]):min(w, b[2])]
+                    if crop.size > 0: cv2.imwrite(crop_local, crop)
 
-                    if v["type"] in ["NO HELMET", "WRONG SIDE", "WRONG LANE",
-                                     "TRIPLE RIDING", "STALLED VEHICLE", "NO SEATBELT"]:
-                        check_dirs()
-                        full_name  = f"full_{uuid.uuid4().hex[:8]}.jpg"
-                        crop_name  = f"crop_{uuid.uuid4().hex[:8]}.jpg"
-                        full_local = os.path.join(assets_dir, full_name)
-                        crop_local = os.path.join(assets_dir, crop_name)
+                    full_s3_key = s3_upload_image(full_local, f"evidence/{full_name}")
+                    crop_s3_key = s3_upload_image(crop_local, f"evidence/{crop_name}")
 
-                        # Highlight the violation area on the full image with a parrot-green box
-                        highlighted_frame = frame.copy()
-                        b = v["box"]
-                        x1, y1, x2, y2 = b
-                        cv2.rectangle(highlighted_frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
-                        cv2.imwrite(full_local, highlighted_frame)
+                    # Save to MongoDB
+                    save_detection(
+                        job_id=job_id,
+                        frame=frame_count,
+                        vehicle_id=str(v["id"]),
+                        plate="VIOLATION",
+                        confidence=1.0, 
+                        status="verified",
+                        violation_type=v["type"],
+                        vehicle_type="unknown",
+                        vehicle_color="unknown",
+                        s3_vehicle_key=full_s3_key,
+                        s3_plate_key=crop_s3_key,
+                        fps=fps
+                    )
 
-                        crop = frame[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-                        if crop.size > 0:
-                            cv2.imwrite(crop_local, crop)
-
-                        full_s3_key = s3_upload_image(full_local, f"evidence/{full_name}")
-                        crop_s3_key = s3_upload_image(crop_local, f"evidence/{crop_name}")
-
-                        full_local_url = f"/outputs/assets/{full_name}"
-                        crop_local_url = f"/outputs/assets/{crop_name}"
-
-                        full_presigned = get_presigned_url(full_s3_key) if full_s3_key else full_local_url
-                        crop_presigned = get_presigned_url(crop_s3_key) if crop_s3_key else crop_local_url
-
-                        formatted["vehicle_image"]   = full_presigned
-                        formatted["plate_image"]     = crop_presigned
-                        formatted["FullImgUrl"]      = full_presigned
-                        formatted["CropImgUrl"]      = crop_presigned
-                        formatted["_s3_vehicle_key"] = full_s3_key
-                        formatted["_s3_plate_key"]   = crop_s3_key
-
-                        save_violation(
+                    # Telegram alert
+                    timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    combined_path = os.path.join(OUTPUT_DIR, f"alert_{job_id}_{frame_count}.jpg")
+                    if create_combined_image(full_local, crop_local, combined_path):
+                        send_local_violation(
+                            combined_path=combined_path,
+                            plate_text="VIOLATION",
                             job_id=job_id,
-                            frame=int(frame_count),
-                            vehicle_id=str(formatted["VehicleID"]),
-                            cls=str(formatted["Type"]),
-                            plate=str(formatted["Plate"]),
-                            s3_vehicle_key=full_s3_key,
-                            s3_plate_key=crop_s3_key,
-                            local_evidence_url=full_local_url,
+                            case_type=case_type,
+                            violation_count=violation_count,
+                            status=v["type"],
+                            timestamp=timestamp_now
                         )
-                        # Mark as alerted to prevent duplicates for this track
-                        service.mark_alerted(v["id"], "N/A")
-
-                    jobs[job_id]["report"].append(formatted)
+                    service.mark_alerted(v["id"], "N/A")
 
             out.write(frame)
 
-        cap.release()
-        out.release()
-
-        violation_count = len(jobs[job_id]["report"])
-        jobs[job_id]["status"]    = "completed"
-        jobs[job_id]["video_url"] = f"/outputs/{os.path.basename(output_path)}"
-
-        # Generate presigned URL for processed output video (if uploaded to S3)
-        output_s3_key = s3_upload_video(output_path, f"output_{os.path.basename(output_path)}")
-        if output_s3_key:
-            jobs[job_id]["s3_output_key"]    = output_s3_key
-            jobs[job_id]["s3_output_presigned"] = get_presigned_url(output_s3_key)
-
-        # Update MongoDB job
+        # Finalize job on success
         update_job_in_db(job_id, "completed", violation_count)
-
+        if job_id in jobs:
+            jobs[job_id]["status"] = "completed"
+        print(f"✅ Job completed successfully: {job_id}")
 
     except Exception as e:
         import traceback
-        error_msg = f"{str(e)}\n{traceback.format_exc()}"
-        print(f"Job {job_id} failed: {error_msg}")
-        with open("debug_log.txt", "w") as f:
-            f.write(error_msg)
-        jobs[job_id]["status"] = "error"
-        jobs[job_id]["error"]  = str(e)
-        update_job_in_db(job_id, "error", 0)
+        err_msg = str(e)
+        print(f"❌ Job failed: {job_id} | Error: {err_msg}\n{traceback.format_exc()}")
+        update_job_in_db(job_id, "failed", violation_count, error_message=err_msg)
+        if job_id in jobs:
+            jobs[job_id]["status"] = "failed"
+            jobs[job_id]["error"] = err_msg
 
-    print(f">>> Job finished: {job_id} | Violations: {len(jobs[job_id]['report'])}")
+    finally:
+        if cap: cap.release()
+        if out: out.release()
+        print(f"Resources released for job: {job_id}")
 
 
 # ── API Endpoints ─────────────────────────────────────────────────────────────
@@ -583,24 +640,110 @@ async def legacy_upload(background_tasks: BackgroundTasks,
 
 @app.get("/status/{job_id}")
 def get_status(job_id: str):
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-    return jobs[job_id]
+    if job_id in jobs:
+        return jobs[job_id]
+    
+    # Fallback to DB
+    job_db = db.jobs.find_one({"job_id": job_id})
+    if job_db:
+        del job_db["_id"]
+        return job_db
+        
+    raise HTTPException(status_code=404, detail="Job not found")
 
 
 @app.get("/report/{job_id}")
-def get_report(job_id: str):
+def get_report(job_id: str, verified_only: bool = True):
     """
-    Returns the violation report with FRESH presigned URLs.
-    S3 keys stored in report are converted to presigned URLs on every call.
+    Returns the violation report with correct keys for frontend and fresh presigned URLs.
     """
-    if job_id not in jobs:
-        raise HTTPException(status_code=404, detail="Job not found")
-
-    raw_report = jobs[job_id].get("report", [])
-    # Regenerate presigned URLs fresh on every call (they expire after 1 hour)
-    enriched = generate_presigned_urls_for_report(raw_report)
+    query = {"job_id": job_id}
+    if verified_only:
+        query["status"] = "verified"
+    
+    raw_results = list(db.vehicles.find(query).sort("frame_number", 1))
+    
+    # Map MongoDB fields to what the frontend expects
+    report_data = []
+    for r in raw_results:
+        report_data.append({
+            "Frame":            r.get("frame_number", 0),
+            "Timestamp":        r.get("timestamp", "00:00:00"),
+            "VehicleID":        r.get("vehicle_id", "N/A"),
+            "Type":             r.get("vehicle_type", "unknown"),
+            "Plate":            r.get("plate_number") or "N/A",
+            "Status":           r.get("status", "low_confidence"),
+            "Confidence":       r.get("confidence", 0.0),
+            "Violation":        r.get("violations")[0] if r.get("violations") else "ANPR",
+            "_s3_vehicle_key":  r.get("vehicle_image_url"),
+            "_s3_plate_key":    r.get("plate_image_url"),
+        })
+    
+    # Enrich with presigned URLs
+    enriched = generate_presigned_urls_for_report(report_data)
     return enriched
+
+@app.get("/ping")
+def ping():
+    return {"status": "ok", "message": "API is alive"}
+
+@app.get("/rag-data/all")
+@app.get("/api/rag-data/all")
+def get_all_rag_data(limit: int = 500):
+    """
+    Export ALL detection data across ALL jobs for RAG ingestion.
+    """
+    detections = list(db.vehicles.find({}).sort("created_at", -1).limit(limit))
+    for det in detections:
+        det["id"] = str(det["_id"])
+        del det["_id"]
+    return {
+        "description": "Consolidated data for RAG chatbot",
+        "total_returned": len(detections),
+        "data": detections
+    }
+
+@app.get("/rag-data/{job_id}")
+@app.get("/api/rag-data/{job_id}")
+def get_rag_data(job_id: str):
+    """
+    Export all extracted data for RAG ingestion.
+    Includes both verified and low-confidence detections.
+    """
+    detections = list(db.vehicles.find({"job_id": job_id}).sort("frame_number", 1))
+    for det in detections:
+        det["id"] = str(det["_id"])
+        del det["_id"]
+    return {
+        "job_id": job_id,
+        "total_detections": len(detections),
+        "data": detections
+    }
+
+@app.get("/api/report/{job_id}/pdf")
+def get_pdf_report(job_id: str):
+    """
+    Generate and return a PDF report of all detections.
+    """
+    detections = list(db.vehicles.find({"job_id": job_id}).sort("frame_number", 1))
+    if not detections:
+        raise HTTPException(status_code=404, detail="No data found for this job")
+    
+    pdf_filename = f"report_{job_id}.pdf"
+    pdf_path = os.path.join(OUTPUT_DIR, pdf_filename)
+    
+    try:
+        generate_violation_pdf(job_id, detections, pdf_path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"PDF generation failed: {e}")
+        
+    # Build a simple URL or use a file response? 
+    # For now, let's just return the URL to the file in /outputs
+    return {
+        "pdf_url": f"/outputs/{pdf_filename}",
+        "job_id": job_id
+    }
+
 
 
 @app.get("/presigned")
@@ -632,47 +775,99 @@ def refresh_report_urls(job_id: str):
     return refreshed
 
 
-@app.get("/search")
-def search_plate(plate: str):
-    """
-    Search for violations by number plate.
-    Returns all matching records with presigned URLs.
-    """
-    if not plate:
-        raise HTTPException(status_code=400, detail="Plate parameter is required")
+@app.get("/api/search/plate")
+def search_by_plate(plate: str, include_low_confidence: bool = False):
+    if not plate: raise HTTPException(400, "Plate required")
+    query = {"plate_number": plate.strip().upper()}
+    if not include_low_confidence:
+        query["status"] = "verified"
     
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database connection not available")
-        
-    try:
-        # Case insensitive regex search on normalized plate
-        query_plate = plate.strip().upper()
-        results = list(db.violations.find({"plate": query_plate}).sort("created_at", -1))
-        
-        # Format for frontend and generate presigned URLs
-        formatted_results = []
-        for r in results:
-            # Map DB fields to consistent frontend keys
-            item = {
-                "Frame": r.get("frame"),
-                "VehicleID": r.get("vehicle_id"),
-                "Type": r.get("class"),
-                "Plate": r.get("plate"),
-                "created_at": r.get("created_at").isoformat() if r.get("created_at") else None,
-                # S3 keys for URL generation
-                "_s3_vehicle_key": r.get("s3_vehicle_key"),
-                "_s3_plate_key": r.get("s3_plate_key"),
-                # Fallbacks
-                "local_evidence": r.get("local_evidence")
-            }
-            formatted_results.append(item)
-            
-        enriched = generate_presigned_urls_for_report(formatted_results)
-        return enriched
-    except Exception as e:
-        print(f"Error in search: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    results = list(db.vehicles.find(query).sort("created_at", -1).limit(50))
+    for r in results:
+        r["id"] = str(r["_id"])
+        del r["_id"]
+        if r.get("vehicle_image_url"):
+            r["vehicle_image_url"] = get_presigned_url(r["vehicle_image_url"])
+        if r.get("plate_image_url"):
+            r["plate_image_url"] = get_presigned_url(r["plate_image_url"])
+    return results
 
+@app.get("/api/search/vehicles")
+def search_vehicles(color: str = None, type: str = None, video_id: str = None, include_low_confidence: bool = False):
+    query = {}
+    if color: query["color"] = color.lower()
+    if type: query["vehicle_type"] = type.lower()
+    if video_id: query["job_id"] = video_id
+    if not include_low_confidence:
+        query["status"] = "verified"
+
+    results = list(db.vehicles.find(query).sort("created_at", -1).limit(50))
+    for r in results:
+        r["id"] = str(r["_id"])
+        del r["_id"]
+        if r.get("vehicle_image_url"):
+            r["vehicle_image_url"] = get_presigned_url(r["vehicle_image_url"])
+        if r.get("plate_image_url"):
+            r["plate_image_url"] = get_presigned_url(r["plate_image_url"])
+    return results
+
+@app.get("/api/violations")
+def get_violations(type: str = None, include_low_confidence: bool = False):
+    query = {}
+    if type: query["violations"] = type.upper()
+    if not include_low_confidence:
+        query["status"] = "verified"
+        
+    results = list(db.vehicles.find(query).sort("created_at", -1).limit(50))
+    for r in results:
+        r["id"] = str(r["_id"])
+        del r["_id"]
+        if r.get("vehicle_image_url"):
+            r["vehicle_image_url"] = get_presigned_url(r["vehicle_image_url"])
+        if r.get("plate_image_url"):
+            r["plate_image_url"] = get_presigned_url(r["plate_image_url"])
+    return results
+
+@app.get("/api/search/time")
+def search_by_time(from_time: str = None, to_time: str = None, fuzzy: str = None, include_low_confidence: bool = False):
+    # fuzzy examples: "today", "last night", "yesterday"
+    query = {}
+    now = datetime.now(timezone.utc)
+    
+    if not include_low_confidence:
+        query["status"] = "verified"
+
+    if fuzzy:
+        fuzzy = fuzzy.lower()
+        if "today" in fuzzy:
+            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            query["created_at"] = {"$gte": start}
+        elif "yesterday" in fuzzy:
+            end = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            from datetime import timedelta
+            start = end - timedelta(days=1)
+            query["created_at"] = {"$gte": start, "$lt": end}
+        elif "last night" in fuzzy:
+            end = now.replace(hour=6, minute=0, second=0, microsecond=0)
+            from datetime import timedelta
+            start = (end - timedelta(days=1)).replace(hour=20, minute=0, second=0, microsecond=0)
+            query["created_at"] = {"$gte": start, "$lt": end}
+            
+    elif from_time or to_time:
+        time_query = {}
+        if from_time: time_query["$gte"] = datetime.fromisoformat(from_time)
+        if to_time: time_query["$lte"] = datetime.fromisoformat(to_time)
+        query["created_at"] = time_query
+
+    results = list(db.vehicles.find(query).sort("created_at", -1).limit(50))
+    for r in results:
+        r["id"] = str(r["_id"])
+        del r["_id"]
+        if r.get("vehicle_image_url"):
+            r["vehicle_image_url"] = get_presigned_url(r["vehicle_image_url"])
+        if r.get("plate_image_url"):
+            r["plate_image_url"] = get_presigned_url(r["plate_image_url"])
+    return results
 
 if __name__ == "__main__":
     import uvicorn
