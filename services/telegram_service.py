@@ -96,14 +96,14 @@ def send_local_violation(combined_path: str, plate_text: str,
         print("WARNING: Telegram credentials not set. Skipping notification.")
         return
 
-    # EXACT Caption Format per Requirements
+    # Professional Caption Format per Requirements
     caption = (
-        f"Title: Traffic AI Detection\n"
-        f"Plate: {plate_text}\n"
-        f"Type: {case_type.upper()}\n"
-        f"Violations: {violation_count}\n"
-        f"Status: {status}\n"
-        f"Date/Time: {timestamp}"
+        f"🚦 *Traffic AI Detection*\n\n"
+        f"🔹 *Plate:* `{plate_text}`\n"
+        f"🔹 *Type:* {case_type.upper()}\n"
+        f"🔹 *Violations:* {violation_count}\n"
+        f"🔹 *Status:* {status}\n"
+        f"📅 *Date/Time:* {timestamp}"
     )
 
     try:
