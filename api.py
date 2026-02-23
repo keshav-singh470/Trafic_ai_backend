@@ -47,7 +47,6 @@ from services.s3_service import (
 from services.telegram_service import send_local_violation, create_combined_image
 from services.pdf_service import generate_violation_pdf
 from shapely.geometry import Polygon
-from openai import OpenAI
 
 VEHICLE_TYPES = ["car", "bike", "bus", "truck", "auto", "cycle", "pedestrian", "unknown"]
 VEHICLE_COLORS = ["red", "blue", "white", "black", "silver", "unknown"]

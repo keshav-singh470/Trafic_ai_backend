@@ -11,3 +11,5 @@ python-dotenv
 dnspython
 boto3
 httpx
+fpdf2
+shapely
