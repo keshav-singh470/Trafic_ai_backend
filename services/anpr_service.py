@@ -5,10 +5,10 @@ import threading
 from datetime import datetime
 from collections import Counter
 from ultralytics import YOLO
-import easyocr
 import numpy as np
 from difflib import SequenceMatcher
 from .base import BaseTrafficService
+from .ocr_service import OCRService
 
 OCR_LOCK = threading.Lock()
 
@@ -30,10 +30,10 @@ OCR_LOCK = threading.Lock()
 #     COOLDOWN_FRAMES frames.
 # ─────────────────────────────────────────────
 
-COOLDOWN_FRAMES  = 90    # ~3s at 30fps - Reduced to allow re-detecting successive vehicles in high traffic
-MIN_VOTES_NEEDED = 8     # Improved from 4 to 8 to ensure OCR stabilizes before reporting
-SPATIAL_IOU_THRESH = 0.3 # Slightly more relaxed overlap
-TIGHT_PAD_PX = 8         # Aggressive tight padding to remove background
+COOLDOWN_FRAMES  = 90    # ~3s at 30fps
+MIN_VOTES_NEEDED = 3     # Reduced from 5 to improve recall for fast vehicles
+SPATIAL_IOU_THRESH = 0.35 # Slightly more sensitive to overlap
+DYNAMIC_PADDING_PCT = 0.15 # Increased padding slightly for better context
 DEBUG_CROP_DIR = "outputs/debug_crops"
 
 INDIAN_STATE_CODES = {
@@ -59,10 +59,9 @@ class ANPRService(BaseTrafficService):
         print("Loading ANPR YOLO model...")
         self.anpr_model = YOLO(anpr_model).to(self.device)
 
-        print("Loading EasyOCR...")
-        self.ocr = easyocr.Reader(['en'], gpu=False)
-        print("EasyOCR loaded.")
-
+        print("Loading OCR Service (PaddleOCR)...")
+        self.ocr_service = OCRService()
+        
         self.blacklist = self._load_blacklist()
 
         # ── Spatial zone tracker ──────────────────────────────
@@ -143,6 +142,19 @@ class ANPRService(BaseTrafficService):
             # 4. Middle characters (Category): ALWAYS LETTERS
             for i in range(4, max(4, length-4)):
                 if t[i] in to_L: t[i] = to_L[t[i]]
+
+        # 5. Final validation check: If text is 10 chars and looks like XX 00 XX 0000
+        # handle the middle part more aggressively if it's mixed
+        if length == 10:
+            # State code check again
+            for i in range(2): 
+                if t[i] in to_L: t[i] = to_L[t[i]]
+            # District check again
+            for i in range(2, 4):
+                if t[i] in to_D: t[i] = to_D[t[i]]
+            # Identifier check again
+            for i in range(6, 10):
+                if t[i] in to_D: t[i] = to_D[t[i]]
         
         return "".join(t)
 
@@ -150,20 +162,21 @@ class ANPRService(BaseTrafficService):
         """
         Two-Level Validation:
         'strict' -> Indian Regex: ^[A-Z]{2}[0-9]{2}[A-Z]{1,2}[0-9]{4}$
-        'soft'   -> Alphanumeric + Length (7-11)
+        'soft'   -> Alphanumeric + Length (8-11)
         """
         if not text: return False
         
         # Normalize: Remove spaces, upper case
-        text = text.replace(" ", "").upper()
+        text = re.sub(r'[^A-Z0-9]', '', text.upper())
         
         # ── SOFT VALIDATION ──────────────────────────────────────────
         if mode == 'soft':
-            return len(text) in range(7, 12) and text.isalnum()
+            return len(text) in range(8, 12) and text.isalnum()
             
         # ── STRICT VALIDATION ────────────────────────────────────────
-        # Regex: ^[A-Z]{2}[0-9]{2}[A-Z]{1,3}[0-9]{4}$ (Support up to 3 letters in middle for safety)
-        pattern = r'^[A-Z]{2}[0-9]{2}[A-Z]{1,3}[0-9]{4}$'
+        # Standard: KA 03 MV 0927 -> ^[A-Z]{2}[0-9]{2}[A-Z]{1,2}[0-9]{4}$
+        # BH Series: 22 BH 1234 AA -> ^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$
+        pattern = r'^[A-Z]{2}[0-9]{2}[A-Z]{1,2}[0-9]{4}$'
         bh_pattern = r'^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$'
         
         if not (re.match(pattern, text) or re.match(bh_pattern, text)):
@@ -185,11 +198,11 @@ class ANPRService(BaseTrafficService):
         text = re.sub(r'^[^A-Z0-9]+|[^A-Z0-9]+$', '', text)
 
         std_10 = r'[A-Z]{2}[0-9]{2}[A-Z]{2}[0-9]{4}'
-        std_9  = r'[A-Z]{2}[0-9]{2}[A-Z]{1}[0-9]{4}'
-        std_8  = r'[A-Z]{2}[0-9]{2}[A-Z]{0,1}[0-9]{4}' # Fallback for 8 chars if we are desperate
+        std_9  = r'[A-Z]{2}[0-9]{1,2}[A-Z]{1,2}[0-9]{4}'
+        std_short = r'[A-Z]{2}[0-9]{2}[A-Z]{0,2}[0-9]{1,4}' # Catch-all for shorter valid patterns
         bh_10  = r'[0-9]{2}BH[0-9]{4}[A-Z]{1,2}'
         
-        for p in [std_10, std_9, bh_10, std_8]:
+        for p in [std_10, std_9, bh_10, std_short]:
             m = re.search(p, text)
             if m: 
                 res = m.group(0)
@@ -314,104 +327,79 @@ class ANPRService(BaseTrafficService):
                     
         self.log_debug(f"VOTE: Winner '{best_plate}' (score={best_total_score}, freq={scores[best_plate]['freq']}, avg_conf={best_avg_conf:.2f})")
         return best_plate, best_avg_conf
-        return best_plate, best_avg_conf
 
     # ── OCR ───────────────────────────────────────────────────
-    def preprocess_for_ocr(self, img):
+    def preprocess_for_ocr(self, img, mode='standard'):
         """
-        ENHANCED PREPROCESSING:
-        Grayscale -> Resize (2x) -> Denoise -> Sharpen -> CLAHE -> Threshold
+        ENHANCED PREPROCESSING with multiple modes for fallback.
         """
         if img is None or img.size == 0: return None
         
-        # 1. Grayscale
+        h, w = img.shape[:2]
+        if w < 60 or h < 20: # Lenient sizing
+            return None
+
+        # 1. Upscale
+        img = cv2.resize(img, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
-        # 2. Resize (2x as requested)
-        h, w = gray.shape[:2]
-        resized = cv2.resize(gray, (w*2, h*2), interpolation=cv2.INTER_CUBIC)
-        
-        # 3. Denoise
-        denoised = cv2.fastNlMeansDenoising(resized, h=10)
-        
-        # 4. CLAHE
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-        enhanced = clahe.apply(denoised)
-        
-        # 5. Sharpen
-        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
-        sharpened = cv2.filter2D(enhanced, -1, kernel)
-
-        # 6. Thresholding (Adaptive)
-        processed = cv2.adaptiveThreshold(
-            sharpened, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, 11, 2
-        )
+        if mode == 'standard':
+            # CLAHE + Denoise + Sharpen
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            gray = clahe.apply(gray)
+            denoised = cv2.fastNlMeansDenoising(gray, None, h=10)
+            kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+            return cv2.filter2D(denoised, -1, kernel)
             
-        return processed
+        elif mode == 'high_contrast':
+            # Otsu Thresholding for sharp characters
+            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            return cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR) # Paddle likes 3 channels
+            
+        elif mode == 'inverse':
+            # For dark plates with light text
+            gray = cv2.bitwise_not(gray)
+            _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            return cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
 
-    def _ocr_pass(self, processed_img):
-        """Helper for a single OCR pass with confidence score."""
-        with OCR_LOCK:
-            results = self.ocr.readtext(
-                processed_img, 
-                allowlist='ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
-            )
-        if not results: return "", 0.0
-        
-        full_text = "".join([r[1] for r in results]).replace(" ", "")
-        avg_conf = sum([r[2] for r in results]) / len(results)
-        return full_text, avg_conf
+        return gray
+
+    def _ocr_pass(self, img):
+        """Helper for a single OCR pass using OCRService."""
+        text, conf = self.ocr_service.get_text(img)
+        return text, conf
 
     def process_plate(self, plate_img):
         """
-        RUN OCR ON ORIGINAL AND ENHANCED CROPS:
-        Returns: { 'text': str, 'conf': float }
+        RUN OCR with multi-mode retry fallback for difficult plates.
         """
         if plate_img is None or plate_img.size == 0:
             return {"text": "", "conf": 0.0}
 
-        # 1. OCR on Original
-        text_orig, conf_orig = self._ocr_pass(plate_img)
-        
-        # 2. OCR on Enhanced
-        processed = self.preprocess_for_ocr(plate_img)
-        text_enh, conf_enh = ("", 0.0)
-        if processed is not None:
-            text_enh, conf_enh = self._ocr_pass(processed)
+        modes = ['standard', 'high_contrast', 'inverse']
+        best_res = {"text": "", "conf": 0.0}
 
-        # 3. Pick best result
-        if conf_enh > conf_orig:
-            raw_text, conf = text_enh, conf_enh
-        else:
-            raw_text, conf = text_orig, conf_orig
+        for mode in modes:
+            processed = self.preprocess_for_ocr(plate_img, mode=mode)
+            if processed is None: continue
+            
+            raw_text, conf = self._ocr_pass(processed)
+            if not raw_text or len(raw_text) < 5: continue
 
-        if not raw_text or len(raw_text) < 6: 
-            return {"text": "", "conf": 0.0}
-
-        # 4. Position-Aware Correlation Fixes
-        corrected = self.position_aware_correct(raw_text)
+            clean_text = re.sub(r'[^A-Z0-9]', '', raw_text.upper())
+            corrected = self.position_aware_correct(clean_text)
+            extracted = self.extract_indian_plate(corrected)
+            final_text = extracted if extracted else corrected
+            
+            # If we find a strict match, return immediately (Eager Return)
+            if self.validate_indian_plate(final_text, mode='strict') and conf > 0.8:
+                return {"text": final_text, "conf": conf, "strict": True}
+            
+            # Keep the best result found so far
+            if conf > best_res["conf"]:
+                best_res = {"text": final_text, "conf": conf, "strict": False}
         
-        # 5. Extract based on Regex (Softened)
-        extracted = self.extract_indian_plate(corrected)
-        final_text = extracted if extracted else corrected
-        
-        # If still very short, it's likely noise, but user asked for 20%+, so we allow it.
-        if len(final_text) < 4:
-            return {"text": "", "conf": 0.0}
-        
-        # 6. M <-> H Dynamic Check
-        if not self.validate_indian_plate(final_text):
-            if "H" in final_text:
-                test_m = final_text.replace("H", "M")
-                if self.validate_indian_plate(test_m):
-                    final_text = test_m
-            elif "M" in final_text:
-                test_h = final_text.replace("M", "H")
-                if self.validate_indian_plate(test_h):
-                    final_text = test_h
-
-        return {"text": final_text, "conf": conf}
+        return best_res
 
     # ── Main detection ────────────────────────────────────────
     def run_detection(self, frame, frame_count):
@@ -423,7 +411,7 @@ class ANPRService(BaseTrafficService):
 
         for box in results.boxes:
             conf = float(box.conf[0])
-            if conf < 0.12: # Lowered from 0.15 for maximum recall on small/fast plates
+            if conf < 0.10: # More lenient YOLO threshold for better recall
                 continue
 
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
@@ -431,17 +419,13 @@ class ANPRService(BaseTrafficService):
             x2, y2 = min(w, x2), min(h, y2)
             det_box = [x1, y1, x2, y2]
 
-            # ── Pre-process Crop ────────────────────────
-            px1, py1 = max(0, x1 - TIGHT_PAD_PX), max(0, y1 - TIGHT_PAD_PX)
-            px2, py2 = min(w, x2 + TIGHT_PAD_PX), min(h, y2 + TIGHT_PAD_PX)
+            # ── Pre-process Crop (Dynamic Padding) ──────────
+            dw, dh = (x2 - x1) * DYNAMIC_PADDING_PCT, (y2 - y1) * DYNAMIC_PADDING_PCT
+            px1, py1 = max(0, int(x1 - dw)), max(0, int(y1 - dh))
+            px2, py2 = min(w, int(x2 + dw)), min(h, int(y2 + dh))
             plate_img = frame[py1:py2, px1:px2]
             
-            # Save debug crop
-            if not os.path.exists(DEBUG_CROP_DIR): os.makedirs(DEBUG_CROP_DIR)
-            crop_fn = f"{DEBUG_CROP_DIR}/z_f{frame_count}_{x1}.jpg"
-            cv2.imwrite(crop_fn, plate_img)
-
-            # ── OCR (Always do OCR for drawing) ──────────
+            # ── OCR (Always do OCR for voting) ────────────
             ocr_res = self.process_plate(plate_img)
             plate_text = ocr_res["text"] or "Detecting..."
             ocr_conf = ocr_res["conf"]
@@ -462,42 +446,52 @@ class ANPRService(BaseTrafficService):
             # EAGER REPORT REMOVED: To prevent duplicates, we only report verified candidates.
             # (Old logic was saving every first sighting, which caused high noise)
 
-            # 2. Cooldown check for "Verified" reporting
+            # 2. Cooldown check
             if zone["reported"]:
                 if frame_count - zone["reported_frame"] < COOLDOWN_FRAMES:
                     continue
                 else:
-                    zone["readings"] = []; zone["reported"] = False; zone["best_plate"] = None; zone["best_conf"] = 0.0
-                    zone["first_frame_saved"] = False
-
-            # Add to voting buffer
+                    # Reset zone for another sighting (e.g. if vehicle stays in view long)
+                    zone["readings"] = []; zone["reported"] = False; zone["best_plate"] = None
+            
+            # Add to readings buffer
             if plate_text != "Detecting..." and len(plate_text) >= 5:
                 zone["readings"].append(ocr_res)
-                if len(zone["readings"]) > 20: zone["readings"] = zone["readings"][-20:]
+                if len(zone["readings"]) > 15: zone["readings"].pop(0)
 
-            # 3. Validation Report (High confidence / Stability)
-            if len(zone["readings"]) >= MIN_VOTES_NEEDED:
+            # 3. Eager Reporting for High Confidence Strict Matches
+            # If we just got a perfect reading, we don't need to wait for MIN_VOTES
+            if ocr_res.get("strict") and not zone["reported"]:
+                zone["reported"] = True
+                zone["reported_frame"] = frame_count
+                zone["best_plate"] = ocr_res["text"]
+                zone["best_conf"] = ocr_res["conf"]
+                
+                to_report.append({
+                    "frame": int(frame_count), "text": ocr_res["text"], "conf": float(ocr_res["conf"]),
+                    "box": det_box, "is_new": True, "alert": ocr_res["text"] in self.blacklist, 
+                    "verified_candidate": True, "eager": True
+                })
+                print(f"🚀 [ZONE {zone_idx}] Eager Reporting: {ocr_res['text']}")
+
+            # 4. Final Aggregation (Multi-frame Voting)
+            elif len(zone["readings"]) >= MIN_VOTES_NEEDED and not zone["reported"]:
                 best_text, best_conf = self._best_vote(zone["readings"])
-                if best_text:
-                    # Only report if it's better or we haven't reported a "stable" one yet
-                    # Enforce Indian plate length (9-10) for 'Verified' status to satisfy user request
-                    is_valid_length = len(best_text) >= 9
+                if best_text and self.validate_indian_plate(best_text, mode='soft'):
+                    zone["reported"] = True
+                    zone["reported_frame"] = frame_count
+                    zone["best_plate"] = best_text
+                    zone["best_conf"] = best_conf
                     
-                    if (not zone["reported"] or best_conf > zone["best_conf"]) and is_valid_length:
-                        zone["reported"] = True
-                        zone["reported_frame"] = frame_count
-                        zone["best_plate"] = best_text
-                        zone["best_conf"] = best_conf
-                        
-                        alert = best_text in self.blacklist
-                        to_report.append({
-                            "frame": int(frame_count), "text": best_text, "conf": float(best_conf),
-                            "box": det_box, "is_new": True, "alert": alert, "verified_candidate": True
-                        })
+                    alert = best_text in self.blacklist
+                    to_report.append({
+                        "frame": int(frame_count), "text": best_text, "conf": float(best_conf),
+                        "box": det_box, "is_new": True, "alert": alert, "verified_candidate": True,
+                        "raw_candidates": zone["readings"]
+                    })
+                    print(f"✅ [ZONE {zone_idx}] Voting Winner: {best_text}")
 
         return all_detections, to_report
-
-        return to_report
 
     def reset(self):
         """Resets the state of the service (tracker and zones)."""

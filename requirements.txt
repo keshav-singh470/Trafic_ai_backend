@@ -1,15 +1,29 @@
+# Core ML
 ultralytics
-easyocr
-protobuf>=3.20.2
+paddlepaddle==2.6.2
+# paddleocr==2.7.0.3  <-- Install manually with: pip install paddleocr==2.7.0.3 --no-deps
+
+# Web & Server
 fastapi
 uvicorn
 python-multipart
-opencv-python
-numpy<2.0.0
-pymongo
 python-dotenv
+
+# Data & DB
+pymongo
 dnspython
 boto3
 httpx
-fpdf2
+numpy<2.0.0
+
+# OCR Logic & Utils (Required by PaddleOCR --no-deps)
+opencv-python
 shapely
+pyclipper
+lmdb
+tqdm
+imgaug
+scikit-image
+pillow
+PyYAML
+fpdf2

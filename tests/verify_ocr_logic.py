@@ -21,9 +21,10 @@ def test_production_logic():
     validation_cases = [
         ("KA03MV0927", True, True),   # Strict: OK, Soft: OK
         ("MH12AB1234", True, True),   # Strict: OK, Soft: OK
+        ("KA05NG5139", True, True),   # User example: OK
         ("KA03 O 927", False, True),  # Strict: FAIL (spaces), Soft: OK (after norm)
+        ("XX12AB1234", False, True),  # Strict: FAIL (Invalid state XX), Soft: OK
         ("ABC 12345", False, True),   # Strict: FAIL, Soft: OK (Length 8)
-        ("A1B2C3D4", False, True),    # Strict: FAIL, Soft: OK (Length 8)
         ("TOO_SHORT", False, False),  # Strict: FAIL, Soft: FAIL (Length < 7)
     ]
     
@@ -32,24 +33,18 @@ def test_production_logic():
         w_res = service.validate_indian_plate(plate, mode='soft')
         print(f"Plate: {plate:10} | Strict: {s_res:5} | Soft: {w_res:5}")
 
-    # 2. Tiered Voting (Strict Priority)
-    print("\n--- Testing Tiered Voting (Strict Priority) ---")
-    # Even if soft-valid outvotes strict-valid, strict should win (security)
-    # UNLESS strict is below the 2-vote stability floor.
-    readings = ["KA03MV0927"] * 2 + ["SOFTPLATE1"] * 10
-    winner = service._best_vote(readings)
-    print(f"Strict (2 votes) vs Soft (10 votes). Winner: {winner} | Match: {winner == 'KA03MV0927'}")
-
-    # 3. Tiered Voting (Soft Fallback with Repetition Check)
-    print("\n--- Testing Soft Fallback (Repetition Check) ---")
-    # Soft needs at least 3 votes to be trusted
-    readings_2 = ["SOFTPLATE1"] * 2
-    winner_2 = service._best_vote(readings_2)
-    print(f"Soft (2 votes). Winner: {winner_2} | Match: {winner_2 is None}") # Should be None/Rejected
+    # 4. Correction Logic
+    print("\n--- Testing Correction Logic ---")
+    correction_cases = [
+        ("TA05H05139", "KA05H05139"), # T -> K heuristic
+        ("KAU5NG5139", "KA05NG5139"), # U -> 0 digit fix
+        ("B3JT34", "B3JT34"),         # Short/Partial
+        ("I31302", "I31302"),         # Short/Partial
+    ]
     
-    readings_3 = ["SOFTPLATE1"] * 3
-    winner_3 = service._best_vote(readings_3)
-    print(f"Soft (3 votes). Winner: {winner_3} | Match: {winner_3 == 'SOFTPLATE1'}")
+    for raw, expected in correction_cases:
+        corrected = service.position_aware_correct(raw)
+        print(f"Raw: {raw:12} | Corrected: {corrected:12} | Match: {corrected == expected}")
 
 if __name__ == "__main__":
     test_production_logic()

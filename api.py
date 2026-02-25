@@ -12,6 +12,8 @@ os.environ["OMP_NUM_THREADS"]                          = "1"
 os.environ["FLAGS_enable_onednn"]                      = "0"
 os.environ["FLAGS_use_onednn"]                         = "0"
 os.environ["FLAGS_enable_pir_api"]                     = "0"
+os.environ["FLAGS_use_pir_api"]                        = "0"
+os.environ["FLAGS_use_mkldnn"]                         = "0"
 os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"]   = "python"
 os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"]    = "True"
 os.environ["GLOG_minloglevel"]                         = "2"
@@ -30,6 +32,7 @@ import threading
 import re
 import contextlib
 from typing import Dict, List
+from difflib import SequenceMatcher
 
 from services.anpr_service import ANPRService
 from services.helmet_service import HelmetService
@@ -48,7 +51,16 @@ from services.telegram_service import send_local_violation, create_combined_imag
 from services.pdf_service import generate_violation_pdf
 from shapely.geometry import Polygon
 
-VEHICLE_TYPES = ["car", "bike", "bus", "truck", "auto", "cycle", "pedestrian", "unknown"]
+# Fixed COCO mapping: 0=pedestrian, 1=cycle, 2=car, 3=bike, 5=bus, 7=truck (yolov8/11 standard)
+VEHICLE_TYPE_MAP = {
+    0: "pedestrian",
+    1: "cycle",
+    2: "car",
+    3: "bike",
+    5: "bus",
+    7: "truck",
+    "auto": "auto" # for custom models
+}
 VEHICLE_COLORS = ["red", "blue", "white", "black", "silver", "unknown"]
 
 @contextlib.asynccontextmanager
@@ -202,7 +214,8 @@ def save_detection(job_id: str, frame: int, vehicle_id: str,
                    plate: str, confidence: float = 0.0, status: str = "low_confidence",
                    violation_type: str = "N/A", vehicle_type: str = "unknown",
                    vehicle_color: str = "unknown", s3_vehicle_key: str = None, 
-                   s3_plate_key: str = None, fps: float = 30.0, raw_ocr: str = None):
+                   s3_plate_key: str = None, fps: float = 30.0, raw_ocr: str = None,
+                   visual_signature: List[float] = None):
     """
     Phase 2: Save to 'vehicles' collection with Plate-based De-duplication.
     Strict Schema: job_id, plate_number, vehicle_type, color, timestamp, frame_number, violations, images.
@@ -226,19 +239,26 @@ def save_detection(job_id: str, frame: int, vehicle_id: str,
             filter_query["vehicle_id"] = vehicle_id
             existing = db.vehicles.find_one(filter_query)
         
-        # Always check for plate-based fuzzy matching to prevent duplicates even if tracker flips
         if not existing and plate_number != "N/A":
-            # Attempt Fuzzy Search for existing plate in same job
-            # We look for a highly similar plate that was detected recently (frame-wise) or globally in job
+            # Hybrid Deduplication: Check for plate text AND visual similarity
             similar_plates = db.vehicles.find({"job_id": job_id, "plate_number": {"$ne": "N/A"}})
             for sp in similar_plates:
-                similarity = SequenceMatcher(None, plate_number, sp["plate_number"]).ratio()
-                if similarity > 0.8: # Strict similarity to avoid merging different vehicles
+                # 1. Text Similarity (Fuzzy OCR matching)
+                text_sim = SequenceMatcher(None, plate_number, sp.get("plate_number", "")).ratio()
+                
+                # 2. Visual Similarity (Re-ID signature comparison)
+                visual_sim = 0.0
+                if visual_signature and sp.get("visual_signature"):
+                    visual_sim = compare_signatures(visual_signature, sp["visual_signature"])
+                
+                # Deduplication Rule: 
+                # Match if text is very similar (>80%) OR text is moderately similar (>65%) AND visual is high (>75%)
+                if text_sim > 0.8 or (text_sim > 0.65 and visual_sim > 0.75):
                     existing = sp
                     filter_query = {"_id": sp["_id"]}
+                    print(f"🔄 Hybrid Dedup Match: {plate_number} matches {sp['plate_number']} (Text: {text_sim:.2f}, Visual: {visual_sim:.2f})")
                     break
             
-            # If still not found by fuzzy, try exact
             if not existing:
                 filter_query = {"job_id": job_id, "plate_number": plate_number}
                 existing = db.vehicles.find_one(filter_query)
@@ -283,6 +303,7 @@ def save_detection(job_id: str, frame: int, vehicle_id: str,
 
         if s3_plate_key:   update_data["$set"]["plate_image_url"]   = s3_plate_key
         if s3_vehicle_key: update_data["$set"]["vehicle_image_url"] = s3_vehicle_key
+        if visual_signature: update_data["$set"]["visual_signature"] = visual_signature
         if raw_ocr:        update_data.setdefault("$push", {})["raw_ocr_candidates"] = raw_ocr
 
         db.vehicles.update_one(filter_query, update_data, upsert=True)
@@ -291,6 +312,37 @@ def save_detection(job_id: str, frame: int, vehicle_id: str,
     except Exception as e:
         print(f"ERROR saving to 'vehicles': {e}")
 
+
+def calculate_visual_signature(img):
+    """
+    Creates a visual fingerprint of a vehicle using color histograms.
+    Matches are based on color distribution to distinguish between different cars 
+    even if the tracker flips IDs.
+    """
+    if img is None or img.size == 0:
+        return None
+    
+    # 1. Resize for consistency
+    img = cv2.resize(img, (128, 128))
+    
+    # 2. Convert to HSV (more robust to lighting than BGR)
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    
+    # 3. Calculate Histogram for H and S channels (ignoring V for brightness robustness)
+    # H: 18 bins, S: 10 bins
+    hist = cv2.calcHist([hsv], [0, 1], None, [18, 10], [0, 180, 0, 256])
+    
+    # 4. Normalize
+    cv2.normalize(hist, hist, alpha=0, beta=1, norm_type=cv2.NORM_MINMAX)
+    
+    return hist.flatten().tolist()
+
+def compare_signatures(sig1, sig2):
+    """Returns correlation between two signatures (0 to 1)."""
+    if sig1 is None or sig2 is None: return 0.0
+    s1 = np.array(sig1, dtype=np.float32).reshape((18, 10))
+    s2 = np.array(sig2, dtype=np.float32).reshape((18, 10))
+    return cv2.compareHist(s1, s2, cv2.HISTCMP_CORREL)
 
 def calculate_iou(boxA, boxB):
     xA = max(boxA[0], boxB[0])
@@ -405,8 +457,8 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                             vbox = tracked.xyxy[i]
                             if vbox[0] <= pcx <= vbox[2] and vbox[1] <= pcy <= vbox[3]:
                                 vehicle_tid = tid
-                                cls_id = tracked.class_id[i]
-                                v_type = VEHICLE_TYPES[int(cls_id)] if int(cls_id) < len(VEHICLE_TYPES) else "unknown"
+                                cls_id = int(tracked.class_id[i])
+                                v_type = VEHICLE_TYPE_MAP.get(cls_id, "unknown")
                                 break
 
                     print(f"🔍 Plate detected: {res['text']} (conf={res['conf']:.2f})")
@@ -420,13 +472,19 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                     # Save Full Vehicle Image
                     highlighted_frame = frame.copy()
                     b = res["box"]
+                    # Calculate visual signature from vehicle region if possible, otherwise plate
+                    # In ANPR mode, we use a larger harvest around the plate for visual Re-ID
+                    v_reid_box = [max(0, b[0]-50), max(0, b[1]-50), min(w, b[2]+50), min(h, b[3]+50)]
+                    v_img = frame[v_reid_box[1]:v_reid_box[3], v_reid_box[0]:v_reid_box[2]]
+                    v_sig = calculate_visual_signature(v_img)
+
                     cv2.rectangle(highlighted_frame, (b[0], b[1]), (b[2], b[3]), (0, 255, 0), 3)
                     cv2.imwrite(full_local, highlighted_frame)
                     
-                    # ── Phase 1: High Quality Plate Crop (Tight Padding) ──
-                    # User requested "same to same" cropping, so we reduce padding
+                    # ── Phase 1: High Quality Plate Crop (Intelligent Padding + Sharpening) ──
                     bw, bh_crop = b[2]-b[0], b[3]-b[1]
-                    pad_w, pad_h = int(bw * 0.05), int(bh_crop * 0.05)
+                    # Increase padding for better visual context but keep it tight enough
+                    pad_w, pad_h = int(bw * 0.15), int(bh_crop * 0.15)
                     x1_pad = max(0, b[0] - pad_w)
                     y1_pad = max(0, b[1] - pad_h)
                     x2_pad = min(w, b[2] + pad_w)
@@ -434,11 +492,15 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                     
                     crop = frame[y1_pad:y2_pad, x1_pad:x2_pad]
                     if crop.size > 0:
+                        # Sharpening for visual clarity
+                        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
+                        crop = cv2.filter2D(crop, -1, kernel)
+                        
                         ch, cw = crop.shape[:2]
-                        if cw < 120 or ch < 40:
-                            # Upscale to min size (Phase 1)
-                            new_w = max(120, cw)
-                            new_h = max(40, ch)
+                        if cw < 300 or ch < 100:
+                            # Upscale for better visibility in report
+                            new_w = max(300, cw)
+                            new_h = int(new_w * (ch/cw))
                             crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
                         cv2.imwrite(crop_local, crop)
                     else:
@@ -469,19 +531,38 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                             vehicle_color=v_color,
                             s3_vehicle_key=full_s3_key,
                             s3_plate_key=crop_s3_key,
-                            fps=fps
+                            fps=fps,
+                            visual_signature=v_sig
                         )
                         
                         violation_count += 1
                         
                         # ── TELEGRAM ALERT LOGIC (Unique per Tracking ID or Plate - UNREPEATED) ──
-                        # Only alert for VERIFIED (Stable) results to ensure accuracy and no-miss
-                        # Added check for minimum length (9-10) to avoid sending bad OCR results
-                        alert_id = str(vehicle_tid) if vehicle_tid is not None else f"plate_{plate_cleanup}"
-                        is_valid_plate = len(plate_cleanup) >= 9
+                        # Fuzzy check for existing alerts to prevent duplicates on ID switches
+                        plate_cleanup = res["text"].strip().upper()
+                        is_duplicate_alert = False
                         
-                        if res.get("verified_candidate") and alert_id not in sent_alerts and is_valid_plate:
-                            sent_alerts.add(alert_id)
+                        # 1. Direct ID/Exact Plate check
+                        alert_id_primary = str(vehicle_tid) if vehicle_tid is not None else f"plate_{plate_cleanup}"
+                        if alert_id_primary in sent_alerts:
+                            is_duplicate_alert = True
+                        
+                        # 2. Fuzzy Plate check against already sent alerts
+                        if not is_duplicate_alert:
+                            for sa in sent_alerts:
+                                if sa.startswith("plate_"):
+                                    sa_plate = sa.replace("plate_", "")
+                                    if SequenceMatcher(None, plate_cleanup, sa_plate).ratio() > 0.8:
+                                        print(f"🚫 [SKIP] Fuzzy Duplicate Alert: {plate_cleanup} matches {sa_plate}")
+                                        is_duplicate_alert = True
+                                        break
+                        
+                        is_valid_plate = len(plate_cleanup) >= 8 # More lenient length for recall
+                        
+                        if not is_duplicate_alert and is_valid_plate:
+                            sent_alerts.add(alert_id_primary)
+                            sent_alerts.add(f"plate_{plate_cleanup}") # Track both for stability
+                            
                             timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                             combined_path = os.path.join(OUTPUT_DIR, f"alert_{job_id}_{frame_count}.jpg")
                             
