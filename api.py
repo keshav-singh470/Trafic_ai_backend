@@ -2,6 +2,8 @@ import os
 from dotenv import load_dotenv
 from pymongo import MongoClient
 from datetime import datetime, timezone
+import time
+import logging
 
 # Load environment variables FIRST
 load_dotenv()
@@ -40,6 +42,7 @@ from services.overload_service import OverloadService
 from services.wrong_side_service import WrongSideService
 from services.stalled_service import StalledService
 from services.seatbelt_service import SeatbeltService
+from services.vehicle_type_service import VehicleTypeService
 from services.s3_service import (
     upload_video as s3_upload_video,
     upload_image as s3_upload_image,
@@ -51,15 +54,14 @@ from services.telegram_service import send_local_violation, create_combined_imag
 from services.pdf_service import generate_violation_pdf
 from shapely.geometry import Polygon
 
-# Fixed COCO mapping: 0=pedestrian, 1=cycle, 2=car, 3=bike, 5=bus, 7=truck (yolov8/11 standard)
 VEHICLE_TYPE_MAP = {
-    0: "pedestrian",
-    1: "cycle",
-    2: "car",
-    3: "bike",
-    5: "bus",
-    7: "truck",
-    "auto": "auto" # for custom models
+    0: "Person",
+    1: "Bicycle",
+    2: "Car",
+    3: "Bike",
+    5: "Bus",
+    7: "Truck",
+    "auto": "Auto-Rickshaw"
 }
 VEHICLE_COLORS = ["red", "blue", "white", "black", "silver", "unknown"]
 
@@ -126,10 +128,11 @@ if not MONGO_URI:
     print("❌ CRITICAL ERROR: MONGO_URI not found in environment variables.")
 else:
     try:
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
+        # Atlas connection needs specific options sometimes, but generally works with default
+        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000, connectTimeoutMS=10000)
         client.admin.command('ping')
-        db = client["ai_traffic_db"]
-        print("✅ MongoDB connected successfully")
+        db = client.get_database() # Uses the DB name from the URI (ai_traffic_db)
+        print(f"✅ MongoDB connected successfully to database: {db.name}")
     except Exception as e:
         print(f"❌ CRITICAL ERROR: Failed to connect to MongoDB. Error: {e}")
 
@@ -151,6 +154,7 @@ WRONGSIDE_SERVICE = WrongSideService(
 )
 STALLED_SERVICE  = StalledService(model_path="models/yolov8n.pt")
 SEATBELT_SERVICE = SeatbeltService(model_path="no_sitbelt.pt")
+VEHICLE_TYPE_SERVICE = VehicleTypeService(model_path="models/best.pt")
 
 print("✅ All models loaded.")
 
@@ -213,7 +217,8 @@ def update_job_in_db(job_id: str, status: str, violation_count: int, error_messa
 def save_detection(job_id: str, frame: int, vehicle_id: str, 
                    plate: str, confidence: float = 0.0, status: str = "low_confidence",
                    violation_type: str = "N/A", vehicle_type: str = "unknown",
-                   vehicle_color: str = "unknown", s3_vehicle_key: str = None, 
+                   vehicle_color: str = "unknown", vehicle_type_confidence: float = 0.0,
+                   s3_vehicle_key: str = None, 
                    s3_plate_key: str = None, fps: float = 30.0, raw_ocr: str = None,
                    visual_signature: List[float] = None):
     """
@@ -285,6 +290,7 @@ def save_detection(job_id: str, frame: int, vehicle_id: str,
                 "vehicle_id":        vehicle_id,
                 "plate_number":      plate_number,
                 "vehicle_type":      vehicle_type,
+                "vehicle_type_confidence": float(vehicle_type_confidence),
                 "color":             vehicle_color,
                 "timestamp":         time_str,
                 "frame_number":      int(frame),
@@ -301,8 +307,12 @@ def save_detection(job_id: str, frame: int, vehicle_id: str,
             }
         }
 
-        if s3_plate_key:   update_data["$set"]["plate_image_url"]   = s3_plate_key
-        if s3_vehicle_key: update_data["$set"]["vehicle_image_url"] = s3_vehicle_key
+        if s3_plate_key:   
+            update_data["$set"]["plate_image_url"] = s3_plate_key
+            update_data["$set"]["_s3_plate_key"] = s3_plate_key
+        if s3_vehicle_key: 
+            update_data["$set"]["vehicle_image_url"] = s3_vehicle_key
+            update_data["$set"]["_s3_vehicle_key"] = s3_vehicle_key
         if visual_signature: update_data["$set"]["visual_signature"] = visual_signature
         if raw_ocr:        update_data.setdefault("$push", {})["raw_ocr_candidates"] = raw_ocr
 
@@ -400,6 +410,7 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
         w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        sent_alerts = {} # Changed from set() to dict for time tracking
 
         # VideoWriter Setup
         codecs = [('mp4v', 'mp4'), ('XVID', 'avi')]
@@ -452,14 +463,29 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                     v_color = "unknown"
                     
                     if tracked is not None and hasattr(tracked, 'tracker_id'):
+                        min_dist = float('inf')
                         for i in range(len(tracked.tracker_id)):
                             tid = tracked.tracker_id[i]
                             vbox = tracked.xyxy[i]
-                            if vbox[0] <= pcx <= vbox[2] and vbox[1] <= pcy <= vbox[3]:
+                            
+                            # Calculate distance from plate center to vehicle box center
+                            vcx = (vbox[0] + vbox[2]) / 2
+                            vcy = (vbox[1] + vbox[3]) / 2
+                            dist = ((pcx - vcx)**2 + (pcy - vcy)**2)**0.5
+                            
+                            # If plate is inside or very close to vehicle box, consider it
+                            if dist < min_dist:
+                                min_dist = dist
                                 vehicle_tid = tid
                                 cls_id = int(tracked.class_id[i])
                                 v_type = VEHICLE_TYPE_MAP.get(cls_id, "unknown")
-                                break
+                                
+                                # ── Auto-Rickshaw Heuristic ──
+                                if cls_id == 5: # Bus
+                                    vw, vh_box = vbox[2]-vbox[0], vbox[3]-vbox[1]
+                                    aspect = vh_box / vw if vw > 0 else 0
+                                    if vw * vh_box < (w * h * 0.15) and aspect > 0.8:
+                                        v_type = "Auto-Rickshaw"
 
                     print(f"🔍 Plate detected: {res['text']} (conf={res['conf']:.2f})")
                     
@@ -519,6 +545,11 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                     # ── SAVING LOGIC ──
                     if res.get("verified_candidate"):
                         # Save result
+                        # ── Vehicle Type Detection Integration ──
+                        v_type_res = VEHICLE_TYPE_SERVICE.get_best_detection(v_img)
+                        final_v_type = v_type_res["type"] if v_type_res["type"] != "unknown" else v_type
+                        v_conf = v_type_res["confidence"]
+
                         save_detection(
                             job_id=job_id,
                             frame=frame_count,
@@ -527,41 +558,60 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                             confidence=res["conf"],
                             status=status,
                             violation_type="ANPR",
-                            vehicle_type=v_type,
+                            vehicle_type=final_v_type,
                             vehicle_color=v_color,
+                            vehicle_type_confidence=v_conf,
                             s3_vehicle_key=full_s3_key,
                             s3_plate_key=crop_s3_key,
                             fps=fps,
                             visual_signature=v_sig
                         )
+
+                        # Enqueue for live frontend report
+                        if job_id in jobs:
+                            jobs[job_id]["report"].append({
+                                "Frame": frame_count,
+                                "VehicleID": str(vehicle_tid) if vehicle_tid is not None else "N/A",
+                                "Type": final_v_type,
+                                "Plate": res["text"],
+                                "CropImgUrl": get_presigned_url(crop_s3_key),
+                                "FullImgUrl": get_presigned_url(full_s3_key),
+                                "vehicle_image": get_presigned_url(full_s3_key),
+                                "plate_image": get_presigned_url(crop_s3_key),
+                                "_s3_vehicle_key": full_s3_key,
+                                "_s3_plate_key": crop_s3_key
+                            })
                         
                         violation_count += 1
                         
                         # ── TELEGRAM ALERT LOGIC (Unique per Tracking ID or Plate - UNREPEATED) ──
-                        # Fuzzy check for existing alerts to prevent duplicates on ID switches
                         plate_cleanup = res["text"].strip().upper()
                         is_duplicate_alert = False
+                        current_time = time.time()
                         
-                        # 1. Direct ID/Exact Plate check
-                        alert_id_primary = str(vehicle_tid) if vehicle_tid is not None else f"plate_{plate_cleanup}"
-                        if alert_id_primary in sent_alerts:
-                            is_duplicate_alert = True
+                        # Time window for deduplication (e.g., 30 seconds)
+                        DEDUPLICATION_WINDOW = 30 
                         
-                        # 2. Fuzzy Plate check against already sent alerts
+                        # 1. Exact Plate check with Time Window
+                        if plate_cleanup in sent_alerts:
+                            last_time = sent_alerts[plate_cleanup]
+                            if (current_time - last_time) < DEDUPLICATION_WINDOW:
+                                is_duplicate_alert = True
+                                print(f"🚫 [SKIP] Duplicate Alert for {plate_cleanup} (within {DEDUPLICATION_WINDOW}s)")
+                        
+                        # 2. Fuzzy Plate check against recently sent alerts
                         if not is_duplicate_alert:
-                            for sa in sent_alerts:
-                                if sa.startswith("plate_"):
-                                    sa_plate = sa.replace("plate_", "")
+                            for sa_plate, sa_time in list(sent_alerts.items()):
+                                if (current_time - sa_time) < DEDUPLICATION_WINDOW:
                                     if SequenceMatcher(None, plate_cleanup, sa_plate).ratio() > 0.8:
                                         print(f"🚫 [SKIP] Fuzzy Duplicate Alert: {plate_cleanup} matches {sa_plate}")
                                         is_duplicate_alert = True
                                         break
                         
-                        is_valid_plate = len(plate_cleanup) >= 8 # More lenient length for recall
+                        is_valid_plate = len(plate_cleanup) >= 7 # Adjusted for Indian plates
                         
                         if not is_duplicate_alert and is_valid_plate:
-                            sent_alerts.add(alert_id_primary)
-                            sent_alerts.add(f"plate_{plate_cleanup}") # Track both for stability
+                            sent_alerts[plate_cleanup] = current_time
                             
                             timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                             combined_path = os.path.join(OUTPUT_DIR, f"alert_{job_id}_{frame_count}.jpg")
@@ -574,9 +624,11 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                                     case_type=case_type,
                                     violation_count=violation_count,
                                     status="Verified" if res["conf"] >= 0.2 else "Low Confidence",
-                                    timestamp=timestamp_now
+                                    timestamp=timestamp_now,
+                                    vehicle_type=final_v_type,
+                                    confidence=v_conf
                                 )
-                                print(f"✈️ Telegram alert sent for unique detection: {res['text']} (conf={res['conf']:.2f})")
+                                print(f"✈️ Telegram alert sent for unique detection: {res['text']} ({final_v_type}, conf={res['conf']:.2f})")
 
             # ── Other violation types ──────────────────────────────────────
             else:
@@ -630,10 +682,25 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                         violation_type=v["type"],
                         vehicle_type="unknown",
                         vehicle_color="unknown",
+                        vehicle_type_confidence=0.0,
                         s3_vehicle_key=full_s3_key,
                         s3_plate_key=crop_s3_key,
                         fps=fps
                     )
+
+                    if job_id in jobs:
+                        jobs[job_id]["report"].append({
+                            "Frame": frame_count,
+                            "VehicleID": str(v["id"]),
+                            "Type": v["type"],
+                            "Plate": "VIOLATION",
+                            "CropImgUrl": get_presigned_url(crop_s3_key),
+                            "FullImgUrl": get_presigned_url(full_s3_key),
+                            "vehicle_image": get_presigned_url(full_s3_key),
+                            "plate_image": get_presigned_url(crop_s3_key),
+                            "_s3_vehicle_key": full_s3_key,
+                            "_s3_plate_key": crop_s3_key
+                        })
 
                     # Telegram alert
                     timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -723,6 +790,9 @@ def get_status(job_id: str):
     if job_id in jobs:
         return jobs[job_id]
     
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database connection not available")
+    
     # Fallback to DB
     job_db = db.jobs.find_one({"job_id": job_id})
     if job_db:
@@ -737,6 +807,9 @@ def get_report(job_id: str, verified_only: bool = True):
     """
     Returns the violation report with correct keys for frontend and fresh presigned URLs.
     """
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database connection not available")
+
     query = {"job_id": job_id}
     if verified_only:
         query["status"] = "verified"
@@ -751,6 +824,7 @@ def get_report(job_id: str, verified_only: bool = True):
             "Timestamp":        r.get("timestamp", "00:00:00"),
             "VehicleID":        r.get("vehicle_id", "N/A"),
             "Type":             r.get("vehicle_type", "unknown"),
+            "TypeConfidence":   r.get("vehicle_type_confidence", 0.0),
             "Plate":            r.get("plate_number") or "N/A",
             "Status":           r.get("status", "low_confidence"),
             "Confidence":       r.get("confidence", 0.0),
@@ -763,6 +837,21 @@ def get_report(job_id: str, verified_only: bool = True):
     enriched = generate_presigned_urls_for_report(report_data)
     return enriched
 
+@app.post("/api/detect-vehicle-type")
+async def api_detect_vehicle_type(file: UploadFile = File(...)):
+    """
+    Test endpoint for vehicle type detection.
+    """
+    contents = await file.read()
+    nparr = np.frombuffer(contents, np.uint8)
+    frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    
+    if frame is None:
+        raise HTTPException(status_code=400, detail="Invalid image")
+        
+    detections = VEHICLE_TYPE_SERVICE.detect_vehicle_type(frame)
+    return {"detections": detections}
+
 @app.get("/ping")
 def ping():
     return {"status": "ok", "message": "API is alive"}
@@ -773,6 +862,9 @@ def get_all_rag_data(limit: int = 500):
     """
     Export ALL detection data across ALL jobs for RAG ingestion.
     """
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database connection not available")
+
     detections = list(db.vehicles.find({}).sort("created_at", -1).limit(limit))
     for det in detections:
         det["id"] = str(det["_id"])
@@ -790,6 +882,8 @@ def get_rag_data(job_id: str):
     Export all extracted data for RAG ingestion.
     Includes both verified and low-confidence detections.
     """
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database connection not available")
     detections = list(db.vehicles.find({"job_id": job_id}).sort("frame_number", 1))
     for det in detections:
         det["id"] = str(det["_id"])
@@ -805,6 +899,8 @@ def get_pdf_report(job_id: str):
     """
     Generate and return a PDF report of all detections.
     """
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database connection not available")
     detections = list(db.vehicles.find({"job_id": job_id}).sort("frame_number", 1))
     if not detections:
         raise HTTPException(status_code=404, detail="No data found for this job")
@@ -858,6 +954,8 @@ def refresh_report_urls(job_id: str):
 @app.get("/api/search/plate")
 def search_by_plate(plate: str, include_low_confidence: bool = False):
     if not plate: raise HTTPException(400, "Plate required")
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database connection not available")
     query = {"plate_number": plate.strip().upper()}
     if not include_low_confidence:
         query["status"] = "verified"
@@ -874,6 +972,8 @@ def search_by_plate(plate: str, include_low_confidence: bool = False):
 
 @app.get("/api/search/vehicles")
 def search_vehicles(color: str = None, type: str = None, video_id: str = None, include_low_confidence: bool = False):
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database connection not available")
     query = {}
     if color: query["color"] = color.lower()
     if type: query["vehicle_type"] = type.lower()
@@ -893,6 +993,8 @@ def search_vehicles(color: str = None, type: str = None, video_id: str = None, i
 
 @app.get("/api/violations")
 def get_violations(type: str = None, include_low_confidence: bool = False):
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database connection not available")
     query = {}
     if type: query["violations"] = type.upper()
     if not include_low_confidence:
@@ -911,6 +1013,8 @@ def get_violations(type: str = None, include_low_confidence: bool = False):
 @app.get("/api/search/time")
 def search_by_time(from_time: str = None, to_time: str = None, fuzzy: str = None, include_low_confidence: bool = False):
     # fuzzy examples: "today", "last night", "yesterday"
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database connection not available")
     query = {}
     now = datetime.now(timezone.utc)
     

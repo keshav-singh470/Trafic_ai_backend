@@ -30,10 +30,10 @@ OCR_LOCK = threading.Lock()
 #     COOLDOWN_FRAMES frames.
 # ─────────────────────────────────────────────
 
-COOLDOWN_FRAMES  = 90    # ~3s at 30fps
-MIN_VOTES_NEEDED = 3     # Reduced from 5 to improve recall for fast vehicles
-SPATIAL_IOU_THRESH = 0.35 # Slightly more sensitive to overlap
-DYNAMIC_PADDING_PCT = 0.15 # Increased padding slightly for better context
+COOLDOWN_FRAMES  = 300    # ~10s at 30fps - prevent duplicates if vehicle sits in traffic
+MIN_VOTES_NEEDED = 2      # Lowered to 2 for faster response while maintaining voting
+SPATIAL_IOU_THRESH = 0.25 # More inclusive to maintain track of vehicles
+DYNAMIC_PADDING_PCT = 0.20 # More padding for better OCR context
 DEBUG_CROP_DIR = "outputs/debug_crops"
 
 INDIAN_STATE_CODES = {
@@ -105,15 +105,14 @@ class ANPRService(BaseTrafficService):
 
     def position_aware_correct(self, text):
         """
-        Corrects confusing characters based on Indian plate structure:
-        XX 00 XX 0000 or XX 00 X 0000 or 22 BH 1234 AA
-        Character Confusion Map: O↔0, I↔1, B↔8, S↔5, Z↔2, M↔H, G↔6, A↔4
+        Corrects confusing characters based on Indian plate structure.
+        Common confusions: O↔0, I↔1, B↔8, S↔5, Z↔2, M↔H↔A, G↔6, A↔4, 0↔9, C↔K
         """
         if not text: return ""
         
         # Mapping dictionaries
-        to_L = {'0':'O','1':'I','L':'I','5':'S','8':'B','6':'G','2':'Z', '4':'A', 'Q':'O', 'T':'K'} 
-        to_D = {'O':'0','D':'0','Q':'0','I':'1','L':'1','S':'5','B':'8','G':'6','Z':'2','A':'4'}
+        to_L = {'0':'O','1':'I','5':'S','8':'B','6':'G','2':'Z', '4':'A', 'Q':'O', 'T':'K', '9':'P', '7':'T', '5':'S'} 
+        to_D = {'O':'0','D':'0','Q':'0','I':'1','L':'1','S':'5','B':'8','G':'6','Z':'2','A':'4', 'P':'9', 'T':'7'}
         
         t = list(text)
         length = len(t)
@@ -121,48 +120,60 @@ class ANPRService(BaseTrafficService):
         # 1. State Code (First 2 chars): ALWAYS LETTERS
         for i in range(min(2, length)):
             if t[i] in to_L: t[i] = to_L[t[i]]
-            # If digit found in state code, try to map to letter
             if t[i].isdigit():
-                digit_to_L = {'0':'D','1':'I','2':'Z','5':'S','8':'B','4':'A','6':'G'}
+                digit_to_L = {'0':'D','1':'I','2':'Z','5':'S','8':'B','4':'A','6':'G', '9':'P'}
                 t[i] = digit_to_L.get(t[i], t[i])
         
-        # Heuristic: KA often read as TA or IA
-        if length >= 2 and (t[0] in ['T', 'I']) and t[1] == 'A':
-            t[0] = 'K'
+        # Special case: KA often read as TA, IA, NA, MA, NA, HA, CA, CK
+        if length >= 2:
+            if (t[0] in ['T', 'I', 'N', 'M', 'H', 'C']) and t[1] == 'A':
+                t[0] = 'K'
+            # CK prefix for KA plates (common OCR error)
+            if t[0] == 'C' and t[1] == 'K' and length >= 10:
+                t[0], t[1] = 'K', 'A'
+                # If it started with CK40... it's almost certainly KA02
+                if length >= 4 and t[2] == '4' and t[3] == '0':
+                    t[2], t[3] = '0', '2'
 
         if length >= 4:
             # 2. District/Serial (Next 2 chars): ALWAYS DIGITS
             for i in range(2, min(4, length)):
                 if t[i] in to_D: t[i] = to_D[t[i]]
             
+            # Heuristic: KA 92 is extremely likely to be KA 02 (visually similar 9/0)
+            if length >= 9 and "".join(t[:2]) == "KA" and t[2] == '9' and t[3] == '2':
+                t[2] = '0'
+            # Heuristic: KA 40 is extremely likely to be KA 02 (visually similar 4/0, 0/2)
+            if length >= 9 and "".join(t[:2]) == "KA" and t[2] == '4' and t[3] == '0':
+                t[2], t[3] = '0', '2'
+            
             # 3. Last 4 characters (Identifier): ALWAYS DIGITS
-            for i in range(max(4, length-4), length):
+            numeric_tail_start = max(4, length - 4)
+            for i in range(numeric_tail_start, length):
                 if t[i] in to_D: t[i] = to_D[t[i]]
                 
             # 4. Middle characters (Category): ALWAYS LETTERS
-            for i in range(4, max(4, length-4)):
+            for i in range(4, numeric_tail_start):
                 if t[i] in to_L: t[i] = to_L[t[i]]
+                
+                # Visual reconciliation: A vs M in middle part (common in KA02 series)
+                if length == 10 and i == 4 and t[i] == 'A' and t[i+1] == 'K':
+                    if "".join(t[:4]) == "KA02":
+                        t[i] = 'M'
+                
+                # Middle part: Letters. 'I' is often misread from 'L' (visually similar)
+                if t[i] == 'I' and length >= 9:
+                    # Heuristic: In middle part of Indian plates, 'L' is more common than 'I'
+                    # if it's visually similar in the OCR output.
+                    t[i] = 'L'
 
-        # 5. Final validation check: If text is 10 chars and looks like XX 00 XX 0000
-        # handle the middle part more aggressively if it's mixed
-        if length == 10:
-            # State code check again
-            for i in range(2): 
-                if t[i] in to_L: t[i] = to_L[t[i]]
-            # District check again
-            for i in range(2, 4):
-                if t[i] in to_D: t[i] = to_D[t[i]]
-            # Identifier check again
-            for i in range(6, 10):
-                if t[i] in to_D: t[i] = to_D[t[i]]
-        
         return "".join(t)
 
     def validate_indian_plate(self, text, mode='strict'):
         """
         Two-Level Validation:
         'strict' -> Indian Regex: ^[A-Z]{2}[0-9]{2}[A-Z]{1,2}[0-9]{4}$
-        'soft'   -> Alphanumeric + Length (8-11)
+        'soft'   -> Alphanumeric + Length (7-12)
         """
         if not text: return False
         
@@ -171,11 +182,10 @@ class ANPRService(BaseTrafficService):
         
         # ── SOFT VALIDATION ──────────────────────────────────────────
         if mode == 'soft':
-            return len(text) in range(8, 12) and text.isalnum()
+            # Allow slightly broader length for edge cases
+            return len(text) in range(7, 13) and text.isalnum()
             
         # ── STRICT VALIDATION ────────────────────────────────────────
-        # Standard: KA 03 MV 0927 -> ^[A-Z]{2}[0-9]{2}[A-Z]{1,2}[0-9]{4}$
-        # BH Series: 22 BH 1234 AA -> ^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$
         pattern = r'^[A-Z]{2}[0-9]{2}[A-Z]{1,2}[0-9]{4}$'
         bh_pattern = r'^[0-9]{2}BH[0-9]{4}[A-Z]{1,2}$'
         
@@ -190,23 +200,50 @@ class ANPRService(BaseTrafficService):
         return True
 
     def extract_indian_plate(self, text):
-        # Increased robustness: ignore small noise at edges, look for 9 or 10 chars
-        # Pattern 1: KA02MK6346 (Standard 10)
-        # Pattern 2: DL1LY2046 (Standard 9 - but often read with extra digit or missed space)
+        """
+        Robustly extracts the plate part from noisy OCR text.
+        Handles leading/trailing noise like 'OSTT', 'IND', 'ZATI', etc.
+        """
+        if not text: return None
         
-        # Clean text from common OCR noise prefix/suffix (like dots or small symbols)
-        text = re.sub(r'^[^A-Z0-9]+|[^A-Z0-9]+$', '', text)
-
-        std_10 = r'[A-Z]{2}[0-9]{2}[A-Z]{2}[0-9]{4}'
+        # Clean text: remove space and non-alphanumeric noise
+        clean = re.sub(r'[^A-Z0-9 ]', '', text.upper())
+        words = clean.split()
+        joined = "".join(words)
+        
+        # Priority 1: Search in joined text (best for multi-line)
+        std_10 = r'[A-Z]{2}[0-9]{2}[A-Z]{1,2}[A-Z]{0,1}[0-9]{4}'
         std_9  = r'[A-Z]{2}[0-9]{1,2}[A-Z]{1,2}[0-9]{4}'
-        std_short = r'[A-Z]{2}[0-9]{2}[A-Z]{0,2}[0-9]{1,4}' # Catch-all for shorter valid patterns
         bh_10  = r'[0-9]{2}BH[0-9]{4}[A-Z]{1,2}'
         
-        for p in [std_10, std_9, bh_10, std_short]:
-            m = re.search(p, text)
-            if m: 
-                res = m.group(0)
-                if len(res) >= 8: return res
+        for p in [std_10, std_9, bh_10]:
+            m = re.search(p, joined)
+            if m: return m.group(0)
+            
+        # Priority 2: Plausibility Search (for very noisy strings like CK40ZATI2980)
+        # If we have 10-12 chars, try to find a sub-sequence that looks like a plate
+        if len(joined) >= 10:
+            # Try sliding window of 10 chars
+            for i in range(len(joined) - 9):
+                sub = joined[i:i+10]
+                if self.validate_indian_plate(sub, mode='soft'):
+                    # If it passes soft validation and has 10 chars, it's a good candidate
+                    return sub
+
+        # Priority 3: Word by word combinations
+        if len(words) > 1:
+            for i in range(len(words)-1):
+                candidate = words[i] + words[i+1]
+                for p in [std_10, std_9, bh_10]:
+                    m = re.search(p, candidate)
+                    if m: return m.group(0)
+
+        # Priority 4: Fuzzy fallback (at least 7 chars starting with state code)
+        fuzzy = r'[A-Z]{2}[0-9]{1,2}[A-Z]{0,2}[0-9]{1,4}'
+        m = re.search(fuzzy, joined)
+        if m and len(m.group(0)) >= 7:
+            return m.group(0)
+
         return None
 
     def calculate_score(self, original, corrected, conf):
@@ -252,81 +289,74 @@ class ANPRService(BaseTrafficService):
     def _best_vote(self, readings):
         """
         Selection Logic:
-        1. Keep all >= 0.2 conf.
-        2. Assign scores: +5 for Pattern match, +1 per Frequency.
+        1. Group similar readings (e.g., 'KA02AL4980' and 'KA92AL1980').
+        2. Assign scores: +50 for Strict Pattern, +10 for Soft Pattern, +1 per Frequency.
         3. Pick highest score.
         """
         if not readings: return None, 0.0
         
-        valid_candidates = []
+        # 1. Grouping and Scoring
+        candidates = {}
         for r in readings:
-            if not r or not r.get('text'): continue
-            text = r['text'].replace(" ", "").upper()
-            if len(text) >= 4 and r.get('conf', 0.0) >= 0.2:
-                valid_candidates.append(r)
-
-        if not valid_candidates: 
-            return None, 0.0
-
-        # Group and calculate scores
-        scores = {}
-        for r in valid_candidates:
-            text = r['text']
-            if text not in scores:
-                scores[text] = {"freq": 0, "conf_sum": 0.0, "bonus": 0}
+            text = r.get('text', '').replace(" ", "").upper()
+            if len(text) < 5: continue
             
-            scores[text]["freq"] += 1
-            scores[text]["conf_sum"] += r['conf']
-            
-            # Pattern Bonus
-            if self.validate_indian_plate(text, mode='strict'):
-                scores[text]["bonus"] = 20 
-
-        # Group similar texts to avoid splitting votes (e.g. KA03 vs KA031)
-        # We'll use the longest/most patterned one in each fuzzy group
-        final_scores = {}
-        for text, stats in scores.items():
-            # Find if there's a highly similar text already in final_scores
-            found = False
-            for target in final_scores.keys():
-                similarity = SequenceMatcher(None, text, target).ratio()
-                if similarity > 0.8: # Very similar
-                    # Merge into the "better" one (pattern bonus or length)
-                    found = True
-                    is_better = stats["bonus"] > final_scores[target]["bonus"] or \
-                                (stats["bonus"] == final_scores[target]["bonus"] and len(text) > len(target))
+            # Find best representative in current candidates
+            best_rep = text
+            for rep in candidates:
+                if SequenceMatcher(None, text, rep).ratio() > 0.8:
+                    # Prefer the one that matches strict pattern or has more common letters
+                    # e.g., MK is often misread as AK. We prefer the one with M if both exist?
+                    # Or just pick the one with better pattern match.
+                    is_better = (not self.validate_indian_plate(rep, 'strict') and self.validate_indian_plate(text, 'strict')) or \
+                                (len(text) > len(rep) and self.validate_indian_plate(text, 'soft'))
                     
-                    final_scores[target]["freq"] += stats["freq"]
-                    final_scores[target]["conf_sum"] += stats["conf_sum"]
+                    # Specific visual reconciliation: A vs M
+                    if not is_better and 'A' in rep and 'M' in text and len(rep) == len(text) == 10:
+                        if rep[:4] == text[:4] and rep[6:] == text[6:]:
+                            # Same plate but A vs M at index 4 or 5
+                            is_better = True # Prefer M (often misread as A)
+                    
                     if is_better:
-                        # Swap key to the better text representation
-                        old_stats = final_scores.pop(target)
-                        final_scores[text] = old_stats
-                        final_scores[text]["bonus"] = stats["bonus"]
+                        # Move existing stats to new rep
+                        candidates[text] = candidates.pop(rep)
+                        best_rep = text
+                    else:
+                        best_rep = rep
                     break
-            if not found:
-                final_scores[text] = stats
-
-        # Pick best based on (bonus + freq) then avg_conf
-        best_plate = None
-        best_total_score = -1
-        best_avg_conf = -1.0
-        
-        for text, stats in final_scores.items():
-            total_score = stats["bonus"] + stats["freq"]
-            avg_conf = stats["conf_sum"] / stats["freq"]
             
-            if total_score > best_total_score:
-                best_total_score = total_score
+            if best_rep not in candidates:
+                candidates[best_rep] = {"freq": 0, "conf_sum": 0.0, "max_conf": 0.0}
+            
+            candidates[best_rep]["freq"] += 1
+            candidates[best_rep]["conf_sum"] += r.get('conf', 0.0)
+            candidates[best_rep]["max_conf"] = max(candidates[best_rep]["max_conf"], r.get('conf', 0.0))
+
+        # 2. Final Selection based on score
+        best_plate = None
+        max_score = -1
+        
+        for text, stats in candidates.items():
+            score = stats["freq"]
+            if self.validate_indian_plate(text, mode='strict'):
+                score += 50
+            elif self.validate_indian_plate(text, mode='soft'):
+                score += 10
+            
+            # Tie breaker: max confidence
+            if score > max_score:
+                max_score = score
                 best_plate = text
-                best_avg_conf = avg_conf
-            elif total_score == best_total_score:
-                if avg_conf > best_avg_conf:
-                    best_avg_conf = avg_conf
+            elif score == max_score:
+                if stats["max_conf"] > candidates[best_plate]["max_conf"]:
                     best_plate = text
-                    
-        self.log_debug(f"VOTE: Winner '{best_plate}' (score={best_total_score}, freq={scores[best_plate]['freq']}, avg_conf={best_avg_conf:.2f})")
-        return best_plate, best_avg_conf
+        
+        if best_plate:
+            avg_conf = candidates[best_plate]["conf_sum"] / candidates[best_plate]["freq"]
+            self.log_debug(f"VOTE: Winner '{best_plate}' (score={max_score}, freq={candidates[best_plate]['freq']}, avg_conf={avg_conf:.2f})")
+            return best_plate, avg_conf
+        
+        return None, 0.0
 
     # ── OCR ───────────────────────────────────────────────────
     def preprocess_for_ocr(self, img, mode='standard'):

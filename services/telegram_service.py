@@ -87,7 +87,8 @@ def create_combined_image(vehicle_path: str, plate_path: str, output_path: str):
 
 def send_local_violation(combined_path: str, plate_text: str, 
                          job_id: str = "N/A", case_type: str = "ANPR", violation_count: int = 1,
-                         status: str = "Success", timestamp: str = "N/A"):
+                         status: str = "Success", timestamp: str = "N/A",
+                         vehicle_type: str = "Unknown", confidence: float = 0.0):
     """
     Sends a single combined image (PIP) with the REAL detection results.
     STRICT: One message only. No links, no URLs.
@@ -96,11 +97,14 @@ def send_local_violation(combined_path: str, plate_text: str,
         print("WARNING: Telegram credentials not set. Skipping notification.")
         return
 
+    conf_str = f" ({confidence*100:.1f}%)" if confidence > 0 else ""
+    
     # Professional Caption Format per Requirements
     caption = (
         f"🚦 *Traffic AI Detection*\n\n"
         f"🔹 *Plate:* `{plate_text}`\n"
-        f"🔹 *Type:* {case_type.upper()}\n"
+        f"🔹 *Type:* {vehicle_type.upper()}{conf_str}\n"
+        f"🔹 *Case:* {case_type.upper()}\n"
         f"🔹 *Violations:* {violation_count}\n"
         f"🔹 *Status:* {status}\n"
         f"📅 *Date/Time:* {timestamp}"

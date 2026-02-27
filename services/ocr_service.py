@@ -39,8 +39,8 @@ class OCRService:
         
         logger.info("Initializing PaddleOCR engine...")
         try:
-            # Initialize PaddleOCR with verified working arguments for this environment
-            self.ocr = PaddleOCR(lang=lang)
+            # Initialize PaddleOCR with angle classifier enabled for rotated plates
+            self.ocr = PaddleOCR(lang=lang, use_angle_cls=True)
             self._initialized = True
             logger.info("PaddleOCR engine initialized successfully.")
         except Exception as e:
@@ -99,20 +99,27 @@ class OCRService:
             confidences = []
 
             # PaddleOCR result is a list of results (one per image), we pass one image
-            for line in result[0]:
-                try:
-                    if not line or len(line) < 2:
+            if result[0]:
+                # Sort blocks by Y-coordinate to handle multi-line plates (top-to-bottom)
+                # Each 'line' is [[ [x1,y1], [x2,y1], [x2,y2], [x1,y2] ], (text, conf)]
+                sorted_lines = sorted(result[0], key=lambda x: x[0][0][1]) 
+
+                for line in sorted_lines:
+                    try:
+                        if not line or len(line) < 2:
+                            continue
+                        
+                        text_data = line[1]
+                        if isinstance(text_data, (tuple, list)) and len(text_data) >= 2:
+                            text, conf = text_data[0], text_data[1]
+                            # Add space if we already have text to keep multi-line parts distinct
+                            if full_text:
+                                full_text += " "
+                            full_text += str(text)
+                            confidences.append(float(conf))
+                    except (IndexError, TypeError, ValueError) as line_err:
+                        logger.warning(f"Skipping malformed OCR line: {line_err}")
                         continue
-                    
-                    # Each line is typically [[coords], (text, conf)]
-                    text_data = line[1]
-                    if isinstance(text_data, (tuple, list)) and len(text_data) >= 2:
-                        text, conf = text_data[0], text_data[1]
-                        full_text += str(text)
-                        confidences.append(float(conf))
-                except (IndexError, TypeError, ValueError) as line_err:
-                    logger.warning(f"Skipping malformed OCR line: {line_err}")
-                    continue
 
             avg_conf = sum(confidences) / len(confidences) if confidences else 0.0
             full_text = full_text.strip().upper()
