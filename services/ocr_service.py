@@ -12,6 +12,8 @@ os.environ["FLAGS_use_onednn"]      = "0"
 os.environ["FLAGS_enable_pir_api"]  = "0"
 os.environ["FLAGS_use_pir_api"]     = "0"
 os.environ["FLAGS_use_mkldnn"]      = "0"
+os.environ["OMP_NUM_THREADS"]       = "1"
+os.environ["MKL_NUM_THREADS"]       = "1"
 
 from paddleocr import PaddleOCR
 
@@ -40,7 +42,13 @@ class OCRService:
         logger.info("Initializing PaddleOCR engine...")
         try:
             # Initialize PaddleOCR with angle classifier enabled for rotated plates
-            self.ocr = PaddleOCR(lang=lang, use_angle_cls=True)
+            self.ocr = PaddleOCR(
+                lang=lang,
+                use_angle_cls=True,
+                use_gpu=False,
+                cpu_threads=2,
+                enable_mkldnn=False
+            )
             self._initialized = True
             logger.info("PaddleOCR engine initialized successfully.")
         except Exception as e:
