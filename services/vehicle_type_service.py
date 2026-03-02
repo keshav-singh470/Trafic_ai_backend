@@ -38,7 +38,8 @@ class VehicleTypeService:
             return []
 
         # Run inference with 0.25 confidence threshold
-        results = self.model(image_or_frame, conf=0.25, verbose=False)[0]
+        with torch.no_grad():
+            results = self.model(image_or_frame, conf=0.25, verbose=False)[0]
         
         detections = []
         for box in results.boxes:

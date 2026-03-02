@@ -6,6 +6,7 @@ from datetime import datetime
 from collections import Counter
 from ultralytics import YOLO
 import numpy as np
+import torch
 from difflib import SequenceMatcher
 from .base import BaseTrafficService
 from .ocr_service import OCRService
@@ -35,9 +36,19 @@ MIN_VOTES_NEEDED = 2      # Lowered to 2 for faster response while maintaining v
 SPATIAL_IOU_THRESH = 0.25 # More inclusive to maintain track of vehicles
 DYNAMIC_PADDING_PCT = 0.20 # More padding for better OCR context
 DEBUG_CROP_DIR = "outputs/debug_crops"
+SHARPNESS_THRESHOLD = 100  # Laplacian variance threshold for sharp plate crops
+UNREAD_FRAME_LIMIT = 10   # Report UNREAD after this many frames without a plate read
 
 INDIAN_STATE_CODES = {
-    "AN", "AP", "AR", "AS", "BR", "CH", "CT", "MH", "DL", "GA", "GJ", "HR", "HP", "JK", "JH", "KA", "KL", "LD", "MP", "MN", "ML", "MZ", "NL", "OD", "PY", "PB", "RJ", "SK", "TN", "TG", "TR", "UP", "UK", "WB", "TS", "BH"
+    "AN", "AP", "AR", "AS", "BR", "CG", "CH", "CT", "DD", "DL", "DN",
+    "GA", "GJ", "HR", "HP", "JH", "JK", "KA", "KL", "LA", "LD",
+    "MH", "ML", "MN", "MP", "MZ", "NL", "OD", "PB", "PY", "RJ",
+    "SK", "TN", "TG", "TR", "TS", "UK", "UP", "WB", "BH"
+}
+
+# Map invalid OCR state codes to closest valid state
+INVALID_STATE_MAP = {
+    'IN': 'TN', 'KN': 'KA', 'IK': 'JK',
 }
 
 
@@ -66,11 +77,14 @@ class ANPRService(BaseTrafficService):
 
         # ── Spatial zone tracker ──────────────────────────────
         # Each entry: {
-        #   "box"          : [x1,y1,x2,y2],   ← representative bbox
-        #   "readings"     : [text, text, ...], ← OCR votes collected
-        #   "reported"     : bool,
-        #   "reported_frame": int,
-        #   "best_plate"   : str or None        ← confirmed plate text
+        #   "box"              : [x1,y1,x2,y2],   ← representative bbox
+        #   "readings"         : [text, text, ...], ← OCR votes collected
+        #   "reported"         : bool,
+        #   "reported_frame"   : int,
+        #   "best_plate"       : str or None        ← confirmed plate text
+        #   "frames_without_read": int              ← track blurry / no-read frames
+        #   "total_frames"     : int                ← total frames this zone has existed
+        #   "unread_reported"  : bool               ← whether UNREAD entry was already sent
         # }
         self.zones = []
 
@@ -99,6 +113,19 @@ class ANPRService(BaseTrafficService):
                     self.log_debug(f"Blacklist error: {e}")
         return list(loaded)
 
+    # ── Sharpness check ──────────────────────────────────────
+    @staticmethod
+    def calculate_sharpness(image):
+        """
+        Calculate sharpness of an image region using Laplacian variance.
+        Higher value = sharper image. Threshold: 100.
+        """
+        if image is None or image.size == 0:
+            return 0.0
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+        laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+        return float(laplacian.var())
+
     # ── Text helpers ──────────────────────────────────────────
     def clean_plate_text(self, text):
         return re.sub(r'[^A-Z0-9]', '', text.upper())
@@ -106,68 +133,72 @@ class ANPRService(BaseTrafficService):
     def position_aware_correct(self, text):
         """
         Corrects confusing characters based on Indian plate structure.
-        Common confusions: O↔0, I↔1, B↔8, S↔5, Z↔2, M↔H↔A, G↔6, A↔4, 0↔9, C↔K
+        Indian format: [LL][DD][L{1,2}][DDDD]
+        Positions 1,2,5,6 = LETTERS | Positions 3,4,7,8,9,10 = DIGITS
         """
         if not text: return ""
         
-        # Mapping dictionaries
-        to_L = {'0':'O','1':'I','5':'S','8':'B','6':'G','2':'Z', '4':'A', 'Q':'O', 'T':'K', '9':'P', '7':'T', '5':'S'} 
-        to_D = {'O':'0','D':'0','Q':'0','I':'1','L':'1','S':'5','B':'8','G':'6','Z':'2','A':'4', 'P':'9', 'T':'7'}
+        raw_text = text  # Save original for logging
+        
+        # User-specified correction maps
+        digit_to_letter = {'0': 'O', '1': 'I', '2': 'Z', '5': 'S', '8': 'B', '6': 'G', '7': 'T'}
+        letter_to_digit = {'O': '0', 'I': '1', 'Z': '2', 'S': '5', 'B': '8', 'G': '6', 'T': '7'}
         
         t = list(text)
         length = len(t)
 
-        # 1. State Code (First 2 chars): ALWAYS LETTERS
+        # 1. Positions 1,2 (idx 0,1) — State Code: MUST be LETTERS
         for i in range(min(2, length)):
-            if t[i] in to_L: t[i] = to_L[t[i]]
-            if t[i].isdigit():
-                digit_to_L = {'0':'D','1':'I','2':'Z','5':'S','8':'B','4':'A','6':'G', '9':'P'}
-                t[i] = digit_to_L.get(t[i], t[i])
-        
-        # Special case: KA often read as TA, IA, NA, MA, NA, HA, CA, CK
-        if length >= 2:
-            if (t[0] in ['T', 'I', 'N', 'M', 'H', 'C']) and t[1] == 'A':
-                t[0] = 'K'
-            # CK prefix for KA plates (common OCR error)
-            if t[0] == 'C' and t[1] == 'K' and length >= 10:
-                t[0], t[1] = 'K', 'A'
-                # If it started with CK40... it's almost certainly KA02
-                if length >= 4 and t[2] == '4' and t[3] == '0':
-                    t[2], t[3] = '0', '2'
+            if t[i].isdigit() and t[i] in digit_to_letter:
+                t[i] = digit_to_letter[t[i]]
 
         if length >= 4:
-            # 2. District/Serial (Next 2 chars): ALWAYS DIGITS
-            for i in range(2, min(4, length)):
-                if t[i] in to_D: t[i] = to_D[t[i]]
-            
-            # Heuristic: KA 92 is extremely likely to be KA 02 (visually similar 9/0)
-            if length >= 9 and "".join(t[:2]) == "KA" and t[2] == '9' and t[3] == '2':
-                t[2] = '0'
-            # Heuristic: KA 40 is extremely likely to be KA 02 (visually similar 4/0, 0/2)
-            if length >= 9 and "".join(t[:2]) == "KA" and t[2] == '4' and t[3] == '0':
-                t[2], t[3] = '0', '2'
-            
-            # 3. Last 4 characters (Identifier): ALWAYS DIGITS
+            # 2. Positions 3,4 (idx 2,3) — District: MUST be DIGITS
+            for i in range(2, 4):
+                if t[i].isalpha() and t[i] in letter_to_digit:
+                    t[i] = letter_to_digit[t[i]]
+
+            # 3. Last 4 chars — Number: MUST be DIGITS
             numeric_tail_start = max(4, length - 4)
             for i in range(numeric_tail_start, length):
-                if t[i] in to_D: t[i] = to_D[t[i]]
-                
-            # 4. Middle characters (Category): ALWAYS LETTERS
-            for i in range(4, numeric_tail_start):
-                if t[i] in to_L: t[i] = to_L[t[i]]
-                
-                # Visual reconciliation: A vs M in middle part (common in KA02 series)
-                if length == 10 and i == 4 and t[i] == 'A' and t[i+1] == 'K':
-                    if "".join(t[:4]) == "KA02":
-                        t[i] = 'M'
-                
-                # Middle part: Letters. 'I' is often misread from 'L' (visually similar)
-                if t[i] == 'I' and length >= 9:
-                    # Heuristic: In middle part of Indian plates, 'L' is more common than 'I'
-                    # if it's visually similar in the OCR output.
-                    t[i] = 'L'
+                if t[i].isalpha() and t[i] in letter_to_digit:
+                    t[i] = letter_to_digit[t[i]]
 
-        return "".join(t)
+            # 4. Middle chars (idx 4 to tail) — Series: MUST be LETTERS
+            for i in range(4, numeric_tail_start):
+                if t[i].isdigit() and t[i] in digit_to_letter:
+                    t[i] = digit_to_letter[t[i]]
+
+        # 5. State code validation — map invalid to closest valid (existing map)
+        if length >= 2:
+            state = "".join(t[:2])
+            if state not in INDIAN_STATE_CODES and state in INVALID_STATE_MAP:
+                corrected_state = INVALID_STATE_MAP[state]
+                t[0], t[1] = corrected_state[0], corrected_state[1]
+                print(f"🔧 State code corrected: {state} → {corrected_state}")
+
+        # 6. NEW: O→K, Z→L state code recovery for common OCR misreads
+        #    If state code is still invalid after standard correction,
+        #    try swapping O→K, Z→L (and 0→K, 2→L) then recheck.
+        if length >= 2:
+            state = "".join(t[:2])
+            if state not in INDIAN_STATE_CODES:
+                ocr_state_swap = {'O': 'K', 'Z': 'L', '0': 'K', '2': 'L'}
+                new_t = list(t)
+                changed = False
+                for i in range(min(2, len(new_t))):
+                    if new_t[i] in ocr_state_swap:
+                        new_t[i] = ocr_state_swap[new_t[i]]
+                        changed = True
+                new_state = "".join(new_t[:2])
+                if changed and new_state in INDIAN_STATE_CODES:
+                    t = new_t
+
+        corrected = "".join(t)
+        if corrected != raw_text:
+            print(f"[OCR FIX] raw={raw_text} corrected={corrected}")
+        
+        return corrected
 
     def validate_indian_plate(self, text, mode='strict'):
         """
@@ -221,13 +252,10 @@ class ANPRService(BaseTrafficService):
             if m: return m.group(0)
             
         # Priority 2: Plausibility Search (for very noisy strings like CK40ZATI2980)
-        # If we have 10-12 chars, try to find a sub-sequence that looks like a plate
         if len(joined) >= 10:
-            # Try sliding window of 10 chars
             for i in range(len(joined) - 9):
                 sub = joined[i:i+10]
                 if self.validate_indian_plate(sub, mode='soft'):
-                    # If it passes soft validation and has 10 chars, it's a good candidate
                     return sub
 
         # Priority 3: Word by word combinations
@@ -305,20 +333,15 @@ class ANPRService(BaseTrafficService):
             best_rep = text
             for rep in candidates:
                 if SequenceMatcher(None, text, rep).ratio() > 0.8:
-                    # Prefer the one that matches strict pattern or has more common letters
-                    # e.g., MK is often misread as AK. We prefer the one with M if both exist?
-                    # Or just pick the one with better pattern match.
                     is_better = (not self.validate_indian_plate(rep, 'strict') and self.validate_indian_plate(text, 'strict')) or \
                                 (len(text) > len(rep) and self.validate_indian_plate(text, 'soft'))
                     
                     # Specific visual reconciliation: A vs M
                     if not is_better and 'A' in rep and 'M' in text and len(rep) == len(text) == 10:
                         if rep[:4] == text[:4] and rep[6:] == text[6:]:
-                            # Same plate but A vs M at index 4 or 5
-                            is_better = True # Prefer M (often misread as A)
+                            is_better = True
                     
                     if is_better:
-                        # Move existing stats to new rep
                         candidates[text] = candidates.pop(rep)
                         best_rep = text
                     else:
@@ -343,7 +366,6 @@ class ANPRService(BaseTrafficService):
             elif self.validate_indian_plate(text, mode='soft'):
                 score += 10
             
-            # Tie breaker: max confidence
             if score > max_score:
                 max_score = score
                 best_plate = text
@@ -433,64 +455,110 @@ class ANPRService(BaseTrafficService):
 
     # ── Main detection ────────────────────────────────────────
     def run_detection(self, frame, frame_count):
-        results = self.anpr_model(frame, verbose=False)[0]
-        all_detections = [] # Every YOLO box + RAW OCR (for drawing)
-        to_report = []      # Validated/Confirmed plates (for DB)
+        """
+        Processing order:
+        1. YOLO detects plates at 640px resolution
+        2. For each plate region → sharpness check
+        3. If sharp → OCR → position_aware_correct()
+        4. Spatial zone tracking + voting
+        5. Returns (all_detections, to_report)
+        
+        Vehicle type (best.pt) and bounding box drawing are handled in api.py.
+        """
+        h_frame, w_frame = frame.shape[:2]
 
-        h, w = frame.shape[:2]
+        # ── Run YOLO plate detection at 640px for speed ──────
+        with torch.no_grad():
+            results = self.anpr_model(frame, imgsz=640, conf=0.35, verbose=False)[0]
+
+        all_detections = []  # Every YOLO box + RAW OCR (for drawing)
+        to_report = []       # Validated/Confirmed plates (for DB)
 
         for box in results.boxes:
             conf = float(box.conf[0])
-            if conf < 0.10: # More lenient YOLO threshold for better recall
-                continue
 
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
             x1, y1 = max(0, x1), max(0, y1)
-            x2, y2 = min(w, x2), min(h, y2)
+            x2, y2 = min(w_frame, x2), min(h_frame, y2)
             det_box = [x1, y1, x2, y2]
+
+            # ── Sharpness check (Problem 1) ──────────────────
+            plate_region = frame[y1:y2, x1:x2]
+            sharpness = self.calculate_sharpness(plate_region)
 
             # ── Pre-process Crop (Dynamic Padding) ──────────
             dw, dh = (x2 - x1) * DYNAMIC_PADDING_PCT, (y2 - y1) * DYNAMIC_PADDING_PCT
             px1, py1 = max(0, int(x1 - dw)), max(0, int(y1 - dh))
-            px2, py2 = min(w, int(x2 + dw)), min(h, int(y2 + dh))
+            px2, py2 = min(w_frame, int(x2 + dw)), min(h_frame, int(y2 + dh))
             plate_img = frame[py1:py2, px1:px2]
-            
-            # ── OCR (Always do OCR for voting) ────────────
-            ocr_res = self.process_plate(plate_img)
-            plate_text = ocr_res["text"] or "Detecting..."
-            ocr_conf = ocr_res["conf"]
-            all_detections.append({"box": det_box, "text": plate_text, "conf": ocr_conf})
 
-            # 1. Spatial zone tracker for validation ────────
+            # 1. Spatial zone tracker ────────────────────────
             zone_idx = self._find_zone(det_box)
             if zone_idx == -1:
                 self.zones.append({
                     "box": det_box, "readings": [], "reported": False,
-                    "reported_frame": -1, "best_plate": None, "best_conf": 0.0
+                    "reported_frame": -1, "best_plate": None, "best_conf": 0.0,
+                    "frames_without_read": 0, "total_frames": 0,
+                    "unread_reported": False
                 })
                 zone_idx = len(self.zones) - 1
 
             zone = self.zones[zone_idx]
             zone["box"] = det_box
-
-            # EAGER REPORT REMOVED: To prevent duplicates, we only report verified candidates.
-            # (Old logic was saving every first sighting, which caused high noise)
+            zone["total_frames"] = zone.get("total_frames", 0) + 1
 
             # 2. Cooldown check
             if zone["reported"]:
                 if frame_count - zone["reported_frame"] < COOLDOWN_FRAMES:
+                    # Still add to all_detections for visualization
+                    all_detections.append({
+                        "box": det_box, "text": zone.get("best_plate", ""),
+                        "conf": zone.get("best_conf", 0.0), "confirmed": True
+                    })
                     continue
                 else:
-                    # Reset zone for another sighting (e.g. if vehicle stays in view long)
-                    zone["readings"] = []; zone["reported"] = False; zone["best_plate"] = None
-            
+                    zone["readings"] = []; zone["reported"] = False
+                    zone["best_plate"] = None; zone["unread_reported"] = False
+                    zone["frames_without_read"] = 0
+
+            # ── If blurry, skip OCR but keep tracking (Problem 1) ──
+            if sharpness < SHARPNESS_THRESHOLD:
+                zone["frames_without_read"] = zone.get("frames_without_read", 0) + 1
+                all_detections.append({
+                    "box": det_box, "text": "Blurry...", "conf": 0.0,
+                    "confirmed": False
+                })
+                # Check if we should report UNREAD (Problem 4)
+                if (zone.get("frames_without_read", 0) >= UNREAD_FRAME_LIMIT
+                        and not zone.get("unread_reported", False)
+                        and not zone["reported"]):
+                    zone["unread_reported"] = True
+                    to_report.append({
+                        "frame": int(frame_count), "text": "UNREAD", "conf": 0.0,
+                        "box": det_box, "is_new": True, "alert": False,
+                        "verified_candidate": True, "unread": True
+                    })
+                    print(f"📋 [ZONE {zone_idx}] UNREAD after {zone['frames_without_read']} blurry frames")
+                continue
+
+            # ── OCR (sharp frame) ─────────────────────────────
+            ocr_res = self.process_plate(plate_img)
+            plate_text = ocr_res["text"] or "Detecting..."
+            ocr_conf = ocr_res["conf"]
+            all_detections.append({
+                "box": det_box, "text": plate_text, "conf": ocr_conf,
+                "confirmed": False
+            })
+
             # Add to readings buffer
             if plate_text != "Detecting..." and len(plate_text) >= 5:
                 zone["readings"].append(ocr_res)
+                zone["frames_without_read"] = 0  # Reset since we got a read
                 if len(zone["readings"]) > 15: zone["readings"].pop(0)
+            else:
+                zone["frames_without_read"] = zone.get("frames_without_read", 0) + 1
 
             # 3. Eager Reporting for High Confidence Strict Matches
-            # If we just got a perfect reading, we don't need to wait for MIN_VOTES
             if ocr_res.get("strict") and not zone["reported"]:
                 zone["reported"] = True
                 zone["reported_frame"] = frame_count
@@ -502,6 +570,8 @@ class ANPRService(BaseTrafficService):
                     "box": det_box, "is_new": True, "alert": ocr_res["text"] in self.blacklist, 
                     "verified_candidate": True, "eager": True
                 })
+                # Mark as confirmed for visualization
+                all_detections[-1]["confirmed"] = True
                 print(f"🚀 [ZONE {zone_idx}] Eager Reporting: {ocr_res['text']}")
 
             # 4. Final Aggregation (Multi-frame Voting)
@@ -519,7 +589,20 @@ class ANPRService(BaseTrafficService):
                         "box": det_box, "is_new": True, "alert": alert, "verified_candidate": True,
                         "raw_candidates": zone["readings"]
                     })
+                    all_detections[-1]["confirmed"] = True
                     print(f"✅ [ZONE {zone_idx}] Voting Winner: {best_text}")
+
+            # 5. UNREAD fallback (Problem 4) — no read after many frames
+            if (zone.get("frames_without_read", 0) >= UNREAD_FRAME_LIMIT
+                    and not zone.get("unread_reported", False)
+                    and not zone["reported"]):
+                zone["unread_reported"] = True
+                to_report.append({
+                    "frame": int(frame_count), "text": "UNREAD", "conf": 0.0,
+                    "box": det_box, "is_new": True, "alert": False,
+                    "verified_candidate": True, "unread": True
+                })
+                print(f"📋 [ZONE {zone_idx}] UNREAD after {zone['frames_without_read']} frames without plate read")
 
         return all_detections, to_report
 

@@ -35,7 +35,9 @@ class BaseTrafficService:
 
     def process_frame(self, frame):
         """Performs detection and tracking on a single frame."""
-        results = self.model(frame, conf=0.3, verbose=False)[0]
+        import torch
+        with torch.no_grad():
+            results = self.model(frame, conf=0.3, verbose=False)[0]
         detections = sv.Detections.from_ultralytics(results)
         
         tracked_detections = self.tracker.update_with_detections(detections)

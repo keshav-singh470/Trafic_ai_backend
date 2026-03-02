@@ -31,10 +31,12 @@ import cv2
 import json
 import numpy as np
 import threading
+import torch
 import re
 import contextlib
 from typing import Dict, List
 from difflib import SequenceMatcher
+from concurrent.futures import ThreadPoolExecutor
 
 from services.anpr_service import ANPRService
 from services.helmet_service import HelmetService
@@ -155,6 +157,10 @@ WRONGSIDE_SERVICE = WrongSideService(
 STALLED_SERVICE  = StalledService(model_path="models/yolov8n.pt")
 SEATBELT_SERVICE = SeatbeltService(model_path="no_sitbelt.pt")
 VEHICLE_TYPE_SERVICE = VehicleTypeService(model_path="models/best.pt")
+print(f"[BEST.PT CLASSES] {VEHICLE_TYPE_SERVICE.class_names}")
+
+# Thread pool for vehicle type detection (non-blocking)
+vtype_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vtype")
 
 print("✅ All models loaded.")
 
@@ -170,6 +176,11 @@ check_dirs()
 app.mount("/outputs", StaticFiles(directory=OUTPUT_DIR), name="outputs")
 
 jobs: Dict[str, Dict] = {}
+
+# ── FIX 2: Global Plate Cooldown Tracker ──────────────────────────────────────
+# Prevents duplicate processing of the same plate within 60 seconds
+plate_cooldown_tracker: Dict[str, float] = {}
+PLATE_COOLDOWN_SECONDS = 60
 
 
 # ── MongoDB helpers ───────────────────────────────────────────────────────────
@@ -442,89 +453,162 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
             frame_count += 1
 
             if case_type in ["anpr", "security", "blacklist"]:
-                # Get tracked objects for vehicle matching first
-                _, tracked = service.process_frame(frame)
-                
+                # ── Step 1-2: YOLO base detection + ByteTrack for Vehicle ID ──
+                with torch.no_grad():
+                    _, tracked = service.process_frame(frame)
+
+                # ── Step 1 (cont): YOLO plate detection (runs at 640px inside anpr_service) ──
                 all_detections, to_report = service.run_detection(frame, frame_count)
-                
-                # Draw raw detections for debugging/output video
+
+                # ── Step 7 (partial): Draw DIM GREY box on all unconfirmed detections ──
+                #    Only confirmed reads get bright green boxes (drawn below in to_report loop)
                 for det in all_detections:
                     b = det["box"]
-                    text = f"{det['text']} ({det['conf']:.2f})"
-                    cv2.rectangle(frame, (b[0], b[1]), (b[2], b[3]), (255, 0, 0), 2)
-                    cv2.putText(frame, text, (b[0], b[1]-10), 0, 0.5, (255, 0, 0), 2)
+                    if not det.get("confirmed", False):
+                        # Dim grey box for unconfirmed / blurry / detecting
+                        cv2.rectangle(frame, (b[0], b[1]), (b[2], b[3]), (100, 100, 100), 1)
 
                 for res in to_report:
-                    # Find matching vehicle ID for mapping
+                    # ── Step 2: Find matching Vehicle ID from ByteTrack ──
                     pcx = (res["box"][0] + res["box"][2]) / 2
                     pcy = (res["box"][1] + res["box"][3]) / 2
                     vehicle_tid = None
                     v_type = "unknown"
                     v_color = "unknown"
-                    
-                    if tracked is not None and hasattr(tracked, 'tracker_id'):
+                    vehicle_full_box = None  # Full vehicle bbox from ByteTrack
+
+                    if tracked is not None and hasattr(tracked, 'tracker_id') and len(tracked.tracker_id) > 0:
                         min_dist = float('inf')
                         for i in range(len(tracked.tracker_id)):
                             tid = tracked.tracker_id[i]
                             vbox = tracked.xyxy[i]
-                            
-                            # Calculate distance from plate center to vehicle box center
+
                             vcx = (vbox[0] + vbox[2]) / 2
                             vcy = (vbox[1] + vbox[3]) / 2
                             dist = ((pcx - vcx)**2 + (pcy - vcy)**2)**0.5
-                            
-                            # If plate is inside or very close to vehicle box, consider it
+
                             if dist < min_dist:
                                 min_dist = dist
                                 vehicle_tid = tid
                                 cls_id = int(tracked.class_id[i])
                                 v_type = VEHICLE_TYPE_MAP.get(cls_id, "unknown")
-                                
+                                vehicle_full_box = [int(vbox[0]), int(vbox[1]), int(vbox[2]), int(vbox[3])]
+
                                 # ── Auto-Rickshaw Heuristic ──
-                                if cls_id == 5: # Bus
+                                if cls_id == 5:  # Bus
                                     vw, vh_box = vbox[2]-vbox[0], vbox[3]-vbox[1]
                                     aspect = vh_box / vw if vw > 0 else 0
                                     if vw * vh_box < (w * h * 0.15) and aspect > 0.8:
                                         v_type = "Auto-Rickshaw"
 
                     print(f"🔍 Plate detected: {res['text']} (conf={res['conf']:.2f})")
-                    
+
+                    # ── Step 5: Cooldown check — skip if duplicate within 60s ──
+                    plate_cleanup = res["text"].strip().upper()
+                    current_time = time.time()
+                    is_cooldown = False
+
+                    # Skip cooldown for UNREAD entries (they should always be saved)
+                    if plate_cleanup != "UNREAD":
+                        if plate_cleanup in plate_cooldown_tracker:
+                            if (current_time - plate_cooldown_tracker[plate_cleanup]) < PLATE_COOLDOWN_SECONDS:
+                                print(f"🚫 [COOLDOWN] Skipping {plate_cleanup} (seen {current_time - plate_cooldown_tracker[plate_cleanup]:.0f}s ago)")
+                                is_cooldown = True
+
+                        if not is_cooldown:
+                            for tp, tt in list(plate_cooldown_tracker.items()):
+                                if (current_time - tt) >= PLATE_COOLDOWN_SECONDS:
+                                    del plate_cooldown_tracker[tp]
+                                    continue
+                                if SequenceMatcher(None, plate_cleanup, tp).ratio() > 0.8:
+                                    print(f"🚫 [COOLDOWN] Fuzzy skip: {plate_cleanup} ≈ {tp}")
+                                    is_cooldown = True
+                                    break
+
+                    if is_cooldown:
+                        continue
+
+                    # Record this plate in cooldown tracker (except UNREAD)
+                    if plate_cleanup != "UNREAD":
+                        plate_cooldown_tracker[plate_cleanup] = current_time
+
+                    # ── Step 4: best.pt on FULL vehicle bbox (in thread) ──
+                    # Extract full vehicle image from tracked bbox (min 80×80)
+                    if vehicle_full_box:
+                        vx1 = max(0, vehicle_full_box[0])
+                        vy1 = max(0, vehicle_full_box[1])
+                        vx2 = min(w, vehicle_full_box[2])
+                        vy2 = min(h, vehicle_full_box[3])
+                        vehicle_crop_for_type = frame[vy1:vy2, vx1:vx2]
+                    else:
+                        # Fallback: use enlarged plate region
+                        b = res["box"]
+                        vx1 = max(0, b[0] - 100)
+                        vy1 = max(0, b[1] - 100)
+                        vx2 = min(w, b[2] + 100)
+                        vy2 = min(h, b[3] + 100)
+                        vehicle_crop_for_type = frame[vy1:vy2, vx1:vx2]
+
+                    # Ensure minimum 80×80 for best.pt
+                    vch, vcw = vehicle_crop_for_type.shape[:2] if vehicle_crop_for_type is not None and vehicle_crop_for_type.size > 0 else (0, 0)
+                    if vch < 80 or vcw < 80:
+                        if vch > 0 and vcw > 0:
+                            vehicle_crop_for_type = cv2.resize(vehicle_crop_for_type, (max(80, vcw), max(80, vch)))
+
+                    # Run best.pt in thread for speed
+                    def _detect_vtype(crop_img):
+                        with torch.no_grad():
+                            return VEHICLE_TYPE_SERVICE.get_best_detection(crop_img)
+
+                    vtype_future = vtype_executor.submit(_detect_vtype, vehicle_crop_for_type.copy())
+
                     assets_id = uuid.uuid4().hex[:8]
                     full_name  = f"anpr_{assets_id}.jpg"
                     crop_name  = f"anpr_crop_{assets_id}.jpg"
                     full_local = os.path.join(assets_dir, full_name)
                     crop_local = os.path.join(assets_dir, crop_name)
 
-                    # Save Full Vehicle Image
-                    highlighted_frame = frame.copy()
                     b = res["box"]
-                    # Calculate visual signature from vehicle region if possible, otherwise plate
-                    # In ANPR mode, we use a larger harvest around the plate for visual Re-ID
+
+                    # Visual signature from vehicle region for Re-ID
                     v_reid_box = [max(0, b[0]-50), max(0, b[1]-50), min(w, b[2]+50), min(h, b[3]+50)]
                     v_img = frame[v_reid_box[1]:v_reid_box[3], v_reid_box[0]:v_reid_box[2]]
                     v_sig = calculate_visual_signature(v_img)
 
-                    cv2.rectangle(highlighted_frame, (b[0], b[1]), (b[2], b[3]), (0, 255, 0), 3)
+                    # ── Step 7: Draw GREEN box ONLY on successfully read vehicles ──
+                    highlighted_frame = frame.copy()
+                    if not res.get("unread", False):
+                        # Bright green box with plate text + Vehicle ID
+                        box_color = (0, 255, 0)  # Green
+                        cv2.rectangle(frame, (b[0], b[1]), (b[2], b[3]), box_color, 3)
+                        label = f"{res['text']}"
+                        if vehicle_tid is not None:
+                            label += f" [V{vehicle_tid}]"
+                        cv2.putText(frame, label, (b[0], b[1]-10), 0, 0.6, box_color, 2)
+                        # Also on highlighted frame for evidence image
+                        cv2.rectangle(highlighted_frame, (b[0], b[1]), (b[2], b[3]), box_color, 3)
+                        cv2.putText(highlighted_frame, label, (b[0], b[1]-10), 0, 0.6, box_color, 2)
+                    else:
+                        # UNREAD: dim yellow box
+                        cv2.rectangle(frame, (b[0], b[1]), (b[2], b[3]), (0, 200, 255), 2)
+                        cv2.rectangle(highlighted_frame, (b[0], b[1]), (b[2], b[3]), (0, 200, 255), 2)
+
                     cv2.imwrite(full_local, highlighted_frame)
-                    
-                    # ── Phase 1: High Quality Plate Crop (Intelligent Padding + Sharpening) ──
+
+                    # ── Phase 1: High Quality Plate Crop ──
                     bw, bh_crop = b[2]-b[0], b[3]-b[1]
-                    # Increase padding for better visual context but keep it tight enough
                     pad_w, pad_h = int(bw * 0.15), int(bh_crop * 0.15)
                     x1_pad = max(0, b[0] - pad_w)
                     y1_pad = max(0, b[1] - pad_h)
                     x2_pad = min(w, b[2] + pad_w)
                     y2_pad = min(h, b[3] + pad_h)
-                    
+
                     crop = frame[y1_pad:y2_pad, x1_pad:x2_pad]
                     if crop.size > 0:
-                        # Sharpening for visual clarity
                         kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
                         crop = cv2.filter2D(crop, -1, kernel)
-                        
                         ch, cw = crop.shape[:2]
                         if cw < 300 or ch < 100:
-                            # Upscale for better visibility in report
                             new_w = max(300, cw)
                             new_h = int(new_w * (ch/cw))
                             crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
@@ -536,20 +620,29 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                     full_s3_key = s3_upload_image(full_local, f"evidence/{full_name}")
                     crop_s3_key = s3_upload_image(crop_local, f"evidence/{crop_name}")
 
-                    # Phase 1: Relaxed Gate 0.85
-                    # Phase 1: Relaxed Gate 0.2 (URGENT)
-                    status = "verified" if res["conf"] >= 0.2 else "low_confidence"
-                    
-                    plate_cleanup = res["text"].strip().upper()
-                    
-                    # ── SAVING LOGIC ──
-                    if res.get("verified_candidate"):
-                        # Save result
-                        # ── Vehicle Type Detection Integration ──
-                        v_type_res = VEHICLE_TYPE_SERVICE.get_best_detection(v_img)
-                        final_v_type = v_type_res["type"] if v_type_res["type"] != "unknown" else v_type
-                        v_conf = v_type_res["confidence"]
+                    # Wait for vehicle type result from thread
+                    try:
+                        v_type_res = vtype_future.result(timeout=5.0)
+                    except Exception as vte:
+                        print(f"⚠️ Vehicle type detection failed: {vte}")
+                        v_type_res = {"type": "unknown", "confidence": 0.0}
 
+                    final_v_type = v_type_res["type"] if v_type_res["type"] != "unknown" else v_type
+                    v_conf = v_type_res["confidence"]
+
+                    # ── Step 6: Confidence check — UNKNOWN if below 60% ──
+                    if v_conf < 0.60:
+                        final_v_type = "UNKNOWN"
+
+                    # Log vehicle type detection
+                    print(f"[VEHICLE TYPE] plate={res['text']} type={final_v_type.upper()} conf={v_conf:.2f}")
+
+                    status = "verified" if res["conf"] >= 0.2 else "low_confidence"
+                    if res.get("unread"):
+                        status = "unread"
+
+                    # ── Step 8: Save MongoDB + S3 + Telegram ──
+                    if res.get("verified_candidate"):
                         save_detection(
                             job_id=job_id,
                             frame=frame_count,
@@ -567,7 +660,6 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                             visual_signature=v_sig
                         )
 
-                        # Enqueue for live frontend report
                         if job_id in jobs:
                             jobs[job_id]["report"].append({
                                 "Frame": frame_count,
@@ -581,41 +673,16 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                                 "_s3_vehicle_key": full_s3_key,
                                 "_s3_plate_key": crop_s3_key
                             })
-                        
+
                         violation_count += 1
-                        
-                        # ── TELEGRAM ALERT LOGIC (Unique per Tracking ID or Plate - UNREPEATED) ──
-                        plate_cleanup = res["text"].strip().upper()
-                        is_duplicate_alert = False
-                        current_time = time.time()
-                        
-                        # Time window for deduplication (e.g., 30 seconds)
-                        DEDUPLICATION_WINDOW = 30 
-                        
-                        # 1. Exact Plate check with Time Window
-                        if plate_cleanup in sent_alerts:
-                            last_time = sent_alerts[plate_cleanup]
-                            if (current_time - last_time) < DEDUPLICATION_WINDOW:
-                                is_duplicate_alert = True
-                                print(f"🚫 [SKIP] Duplicate Alert for {plate_cleanup} (within {DEDUPLICATION_WINDOW}s)")
-                        
-                        # 2. Fuzzy Plate check against recently sent alerts
-                        if not is_duplicate_alert:
-                            for sa_plate, sa_time in list(sent_alerts.items()):
-                                if (current_time - sa_time) < DEDUPLICATION_WINDOW:
-                                    if SequenceMatcher(None, plate_cleanup, sa_plate).ratio() > 0.8:
-                                        print(f"🚫 [SKIP] Fuzzy Duplicate Alert: {plate_cleanup} matches {sa_plate}")
-                                        is_duplicate_alert = True
-                                        break
-                        
-                        is_valid_plate = len(plate_cleanup) >= 7 # Adjusted for Indian plates
-                        
-                        if not is_duplicate_alert and is_valid_plate:
-                            sent_alerts[plate_cleanup] = current_time
-                            
+
+                        # ── TELEGRAM ALERT (Cooldown already handled above) ──
+                        is_valid_plate = len(plate_cleanup) >= 7 and plate_cleanup != "UNREAD"
+
+                        if is_valid_plate:
                             timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                             combined_path = os.path.join(OUTPUT_DIR, f"alert_{job_id}_{frame_count}.jpg")
-                            
+
                             if create_combined_image(full_local, crop_local, combined_path):
                                 send_local_violation(
                                     combined_path=combined_path,
@@ -628,7 +695,7 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                                     vehicle_type=final_v_type,
                                     confidence=v_conf
                                 )
-                                print(f"✈️ Telegram alert sent for unique detection: {res['text']} ({final_v_type}, conf={res['conf']:.2f})")
+                                print(f"✈️ Telegram alert sent: {res['text']} ({final_v_type}, conf={res['conf']:.2f})")
 
             # ── Other violation types ──────────────────────────────────────
             else:
