@@ -34,10 +34,10 @@ OCR_LOCK = threading.Lock()
 COOLDOWN_FRAMES  = 300    # ~10s at 30fps - prevent duplicates if vehicle sits in traffic
 MIN_VOTES_NEEDED = 2      # Lowered to 2 for faster response while maintaining voting
 SPATIAL_IOU_THRESH = 0.25 # More inclusive to maintain track of vehicles
-DYNAMIC_PADDING_PCT = 0.20 # More padding for better OCR context
+DYNAMIC_PADDING_PCT = 0.50 # 50% padding ensures FULL plate is always captured even at frame edges
 DEBUG_CROP_DIR = "outputs/debug_crops"
 SHARPNESS_THRESHOLD = 100  # Laplacian variance threshold for sharp plate crops
-UNREAD_FRAME_LIMIT = 10   # Report UNREAD after this many frames without a plate read
+UNREAD_FRAME_LIMIT = 5    # Report UNREAD after this many frames without a valid plate read (lowered for faster response)
 
 INDIAN_STATE_CODES = {
     "AN", "AP", "AR", "AS", "BR", "CG", "CH", "CT", "DD", "DL", "DN",
@@ -49,6 +49,11 @@ INDIAN_STATE_CODES = {
 # Map invalid OCR state codes to closest valid state
 INVALID_STATE_MAP = {
     'IN': 'TN', 'KN': 'KA', 'IK': 'JK',
+}
+
+BANNED_WORDS = {
+    "HINDUJA", "GROUP", "GOODS", "CARRIER", "HSRP", "INDIA", 
+    "STOP", "SIGNAL", "POLICE", "AMBULANCE", "ARMY", "NAVY"
 }
 
 
@@ -135,14 +140,24 @@ class ANPRService(BaseTrafficService):
         Corrects confusing characters based on Indian plate structure.
         Indian format: [LL][DD][L{1,2}][DDDD]
         Positions 1,2,5,6 = LETTERS | Positions 3,4,7,8,9,10 = DIGITS
+        
+        KEY FIXES for Indian ANPR:
+        - M vs H confusion (very common in Indian fonts)
+        - N vs H confusion
+        - Strict series-letter recovery
         """
         if not text: return ""
         
         raw_text = text  # Save original for logging
         
-        # User-specified correction maps
+        # Correction maps
         digit_to_letter = {'0': 'O', '1': 'I', '2': 'Z', '5': 'S', '8': 'B', '6': 'G', '7': 'T'}
         letter_to_digit = {'O': '0', 'I': '1', 'Z': '2', 'S': '5', 'B': '8', 'G': '6', 'T': '7'}
+        
+        # INDIAN FONT: H and M look nearly identical in bold fonts.
+        # N and M also get confused. These only apply in LETTER positions.
+        # We'll try M first in series positions when H/N appears.
+        SERIES_LETTER_FIX = {'H': 'M', 'N': 'M'}
         
         t = list(text)
         length = len(t)
@@ -162,14 +177,30 @@ class ANPRService(BaseTrafficService):
             numeric_tail_start = max(4, length - 4)
             for i in range(numeric_tail_start, length):
                 if t[i].isalpha() and t[i] in letter_to_digit:
-                    t[i] = letter_to_digit[t[i]]
+                    # Specific check for Indian font 'A' vs '4' or 'L' vs '1'
+                    if t[i] == 'A' and i >= length - 4:
+                        t[i] = '4'
+                    elif t[i] == 'L' and i >= length - 4:
+                        t[i] = '1'
+                    else:
+                        t[i] = letter_to_digit[t[i]]
 
             # 4. Middle chars (idx 4 to tail) — Series: MUST be LETTERS
             for i in range(4, numeric_tail_start):
                 if t[i].isdigit() and t[i] in digit_to_letter:
                     t[i] = digit_to_letter[t[i]]
+                # FIX: M/H/N confusion in series positions
+                # e.g., KA55H4L → KA55M4L (H misread as M)
+                # Apply M swap only if total length looks like a full plate (9-10 chars)
+                elif t[i].isalpha() and t[i] in SERIES_LETTER_FIX and length >= 9:
+                    candidate_t = list(t)
+                    candidate_t[i] = SERIES_LETTER_FIX[t[i]]
+                    candidate_text = ''.join(candidate_t)
+                    if self.validate_indian_plate(candidate_text, mode='strict'):
+                        print(f"[M/H FIX] Swapped '{t[i]}' → '{SERIES_LETTER_FIX[t[i]]}' at pos {i}: {''.join(t)} → {candidate_text}")
+                        t[i] = SERIES_LETTER_FIX[t[i]]
 
-        # 5. State code validation — map invalid to closest valid (existing map)
+        # 5. State code validation — map invalid to closest valid
         if length >= 2:
             state = "".join(t[:2])
             if state not in INDIAN_STATE_CODES and state in INVALID_STATE_MAP:
@@ -177,9 +208,7 @@ class ANPRService(BaseTrafficService):
                 t[0], t[1] = corrected_state[0], corrected_state[1]
                 print(f"🔧 State code corrected: {state} → {corrected_state}")
 
-        # 6. NEW: O→K, Z→L state code recovery for common OCR misreads
-        #    If state code is still invalid after standard correction,
-        #    try swapping O→K, Z→L (and 0→K, 2→L) then recheck.
+        # 6. O→K, Z→L state code recovery for common OCR misreads
         if length >= 2:
             state = "".join(t[:2])
             if state not in INDIAN_STATE_CODES:
@@ -194,7 +223,16 @@ class ANPRService(BaseTrafficService):
                 if changed and new_state in INDIAN_STATE_CODES:
                     t = new_t
 
+        # 7. Final Polish
         corrected = "".join(t)
+        
+        if length >= 9:
+            # '1' where a letter should be (e.g. KA02L1...)
+            if length == 10 and corrected[5].isdigit() and corrected[5] == '1':
+                corrected = corrected[:5] + 'I' + corrected[6:]
+            elif length == 10 and corrected[4].isdigit() and corrected[4] == '1':
+                corrected = corrected[:4] + 'I' + corrected[5:]
+
         if corrected != raw_text:
             print(f"[OCR FIX] raw={raw_text} corrected={corrected}")
         
@@ -228,6 +266,47 @@ class ANPRService(BaseTrafficService):
         if state_code.isalpha() and state_code not in INDIAN_STATE_CODES:
             return False
             
+        return True
+
+    def is_full_plate(self, plate_img, text):
+        """
+        Verifies if the plate is likely 'full' and not a partial view.
+        Uses aspect ratio, character count, and banned words filter.
+        """
+        if not text or plate_img is None or plate_img.size == 0:
+            return False
+            
+        clean_text = re.sub(r'[^A-Z0-9]', '', text.upper())
+        
+        # 1. BANNED WORDS FILTER (False Positive Prevention)
+        for word in BANNED_WORDS:
+            if word in clean_text or word in text.upper():
+                print(f"🚫 [FILTER] Blocked false positive word: {word}")
+                return False
+
+        h, w = plate_img.shape[:2]
+        if w == 0 or h == 0: return False
+        
+        aspect_ratio = w / h
+        # 2. ASPECT RATIO: Relaxed to 1.5 to allow partial/angled Indian plates
+        # (Old value 2.1 was rejecting many valid plates with ratio 1.5–2.0)
+        if aspect_ratio < 1.5 or aspect_ratio > 7.0: 
+            return False
+            
+        # 3. CHARACTER COUNT: Full Indian plate MUST have 8-10 characters
+        # (e.g., KA02LA7982 is 10, DL1C1234 is 8)
+        if len(clean_text) < 7:
+            return False
+            
+        # 4. PATTERN VESTIGE: Should generally look like an Indian plate (LL at start)
+        if len(clean_text) >= 2:
+            state = clean_text[:2]
+            # If start is digits, it might be a BH plate or error, but LL is standard
+            if state.isdigit() and "BH" not in clean_text:
+                pass # Allow BH fallback 
+            elif not state[0].isalpha(): # If first char is digit and not BH, likely not a plate
+                return False
+
         return True
 
     def extract_indian_plate(self, text):
@@ -355,6 +434,33 @@ class ANPRService(BaseTrafficService):
             candidates[best_rep]["conf_sum"] += r.get('conf', 0.0)
             candidates[best_rep]["max_conf"] = max(candidates[best_rep]["max_conf"], r.get('conf', 0.0))
 
+        # EXTRA: If two candidates differ only in H/M at series position, prefer the strictly valid one
+        keys = list(candidates.keys())
+        for i in range(len(keys)):
+            for j in range(i + 1, len(keys)):
+                a, b = keys[i], keys[j]
+                if len(a) == len(b) and len(a) >= 9:
+                    diffs = [(idx, a[idx], b[idx]) for idx in range(len(a)) if a[idx] != b[idx]]
+                    if len(diffs) == 1:
+                        idx_d, ca, cb = diffs[0]
+                        if 4 <= idx_d <= 5 and {ca, cb} <= {'H', 'M', 'N'}:
+                            # Merge into the strictly valid one
+                            if self.validate_indian_plate(a, 'strict') and not self.validate_indian_plate(b, 'strict'):
+                                candidates[a]["freq"] += candidates[b]["freq"]
+                                candidates[a]["conf_sum"] += candidates[b]["conf_sum"]
+                                candidates[a]["max_conf"] = max(candidates[a]["max_conf"], candidates[b]["max_conf"])
+                                del candidates[b]
+                                keys[j] = a  # Prevent re-processing
+                                print(f"[M/H MERGE] Merged '{b}' into '{a}'")
+                            elif self.validate_indian_plate(b, 'strict') and not self.validate_indian_plate(a, 'strict'):
+                                candidates[b]["freq"] += candidates[a]["freq"]
+                                candidates[b]["conf_sum"] += candidates[a]["conf_sum"]
+                                candidates[b]["max_conf"] = max(candidates[b]["max_conf"], candidates[a]["max_conf"])
+                                del candidates[a]
+                                keys[i] = b
+                                print(f"[M/H MERGE] Merged '{a}' into '{b}'")
+                                break
+
         # 2. Final Selection based on score
         best_plate = None
         max_score = -1
@@ -396,12 +502,12 @@ class ANPRService(BaseTrafficService):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         
         if mode == 'standard':
-            # CLAHE + Denoise + Sharpen
+            # CLAHE + Light Denoise (reduced from h=10)
             clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
             gray = clahe.apply(gray)
-            denoised = cv2.fastNlMeansDenoising(gray, None, h=10)
-            kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
-            return cv2.filter2D(denoised, -1, kernel)
+            denoised = cv2.fastNlMeansDenoising(gray, None, h=5)
+            # Subtle sharpening only if needed
+            return denoised
             
         elif mode == 'high_contrast':
             # Otsu Thresholding for sharp characters
@@ -443,6 +549,10 @@ class ANPRService(BaseTrafficService):
             extracted = self.extract_indian_plate(corrected)
             final_text = extracted if extracted else corrected
             
+            # ── Full Plate Verification ──
+            if not self.is_full_plate(plate_img, final_text):
+                continue
+
             # If we find a strict match, return immediately (Eager Return)
             if self.validate_indian_plate(final_text, mode='strict') and conf > 0.8:
                 return {"text": final_text, "conf": conf, "strict": True}
@@ -543,19 +653,24 @@ class ANPRService(BaseTrafficService):
 
             # ── OCR (sharp frame) ─────────────────────────────
             ocr_res = self.process_plate(plate_img)
-            plate_text = ocr_res["text"] or "Detecting..."
+            plate_text = ocr_res["text"] or ""
             ocr_conf = ocr_res["conf"]
+
+            display_text = plate_text if plate_text else "Detecting..."
             all_detections.append({
-                "box": det_box, "text": plate_text, "conf": ocr_conf,
+                "box": det_box, "text": display_text, "conf": ocr_conf,
                 "confirmed": False
             })
 
-            # Add to readings buffer
-            if plate_text != "Detecting..." and len(plate_text) >= 5:
+            # Add to readings buffer — only if we got a meaningful valid read
+            if plate_text and len(plate_text) >= 5:
                 zone["readings"].append(ocr_res)
-                zone["frames_without_read"] = 0  # Reset since we got a read
+                zone["frames_without_read"] = 0  # Reset since we got a valid read
                 if len(zone["readings"]) > 15: zone["readings"].pop(0)
             else:
+                # FIX: Increment NOT just for blurry, but also when OCR ran but returned
+                # nothing useful (short text, failed aspect ratio, etc.)
+                # This ensures UNREAD is triggered for sharp-but-unreadable plates too.
                 zone["frames_without_read"] = zone.get("frames_without_read", 0) + 1
 
             # 3. Eager Reporting for High Confidence Strict Matches

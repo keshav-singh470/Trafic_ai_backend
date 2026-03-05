@@ -56,14 +56,34 @@ from services.telegram_service import send_local_violation, create_combined_imag
 from services.pdf_service import generate_violation_pdf
 from shapely.geometry import Polygon
 
+# COCO class IDs (from yolov8n.pt base model) + best.pt string labels
 VEHICLE_TYPE_MAP = {
-    0: "Person",
-    1: "Bicycle",
-    2: "Car",
-    3: "Bike",
-    5: "Bus",
-    7: "Truck",
-    "auto": "Auto-Rickshaw"
+    # COCO class IDs
+    1: "Bike",           # bicycle
+    2: "Car",            # car
+    3: "Bike",           # motorcycle
+    5: "Bus",            # bus
+    6: "Truck",          # train (rare, treat as truck)
+    7: "Truck",          # truck
+    8: "Truck",          # boat mapped to truck as fallback
+    # best.pt string labels (lowercased)
+    "car": "Car",
+    "bus": "Bus",
+    "truck": "Truck",
+    "bike": "Bike",
+    "motorcycle": "Bike",
+    "bicycle": "Bike",
+    "scooter": "Scooter",
+    "scooty": "Scooter",
+    "auto": "Auto-Rickshaw",
+    "autorickshaw": "Auto-Rickshaw",
+    "auto-rickshaw": "Auto-Rickshaw",
+    "auto rickshaw": "Auto-Rickshaw",
+    "rickshaw": "Auto-Rickshaw",
+    "tempo": "Truck",
+    "van": "Car",
+    "suv": "Car",
+    "sedan": "Car",
 }
 VEHICLE_COLORS = ["red", "blue", "white", "black", "silver", "unknown"]
 
@@ -231,12 +251,15 @@ def save_detection(job_id: str, frame: int, vehicle_id: str,
                    vehicle_color: str = "unknown", vehicle_type_confidence: float = 0.0,
                    s3_vehicle_key: str = None, 
                    s3_plate_key: str = None, fps: float = 30.0, raw_ocr: str = None,
-                   visual_signature: List[float] = None):
+                   visual_signature: List[float] = None,
+                   source_id: str = "video_upload", job_status: str = "processing",
+                   processing_time: float = 0.0):
     """
     Phase 2: Save to 'vehicles' collection with Plate-based De-duplication.
     Strict Schema: job_id, plate_number, vehicle_type, color, timestamp, frame_number, violations, images.
     """
     if db is None: return
+    import uuid
     try:
         total_seconds = int(frame / fps)
         time_str = f"{total_seconds // 3600:02d}:{(total_seconds % 3600) // 60:02d}:{total_seconds % 60:02d}"
@@ -306,6 +329,12 @@ def save_detection(job_id: str, frame: int, vehicle_id: str,
                 "timestamp":         time_str,
                 "frame_number":      int(frame),
                 "confidence":        float(confidence),
+                "plate_confidence":   float(confidence),
+                "vehicle_confidence": float(vehicle_type_confidence),
+                "source_id":         source_id,
+                "job_status":        job_status,
+                "frames_processed":  int(frame),
+                "processing_time_seconds": float(processing_time),
                 "status":            status,
                 "updated_at":        datetime.now(timezone.utc),
             },
@@ -314,15 +343,19 @@ def save_detection(job_id: str, frame: int, vehicle_id: str,
             },
             "$setOnInsert": {
                 "job_id":            job_id,
+                "detection_id":      str(uuid.uuid4()),
                 "created_at":        datetime.now(timezone.utc),
+                "violation_type":    violation_type.upper() if violation_type else "ANPR",
             }
         }
 
         if s3_plate_key:   
             update_data["$set"]["plate_image_url"] = s3_plate_key
+            update_data["$set"]["plate_crop_image"] = s3_plate_key
             update_data["$set"]["_s3_plate_key"] = s3_plate_key
         if s3_vehicle_key: 
             update_data["$set"]["vehicle_image_url"] = s3_vehicle_key
+            update_data["$set"]["vehicle_image"] = s3_vehicle_key
             update_data["$set"]["_s3_vehicle_key"] = s3_vehicle_key
         if visual_signature: update_data["$set"]["visual_signature"] = visual_signature
         if raw_ocr:        update_data.setdefault("$push", {})["raw_ocr_candidates"] = raw_ocr
@@ -393,6 +426,10 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
     # Track sent alerts to ensure one alert per unique plate per job (URGENT)
     sent_alerts = set()
     
+    # NEW: Per-job processed plates set for duplicate filtering
+    job_processed_plates = set()
+    job_start_time = time.time()
+    
     try:
         # Select service
         if case_type in ["anpr", "security", "blacklist"]:
@@ -421,7 +458,10 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
         w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-        sent_alerts = {} # Changed from set() to dict for time tracking
+        sent_alerts = {} 
+        # NEW: Zero-Miss Tracking Metadata
+        # { tid: { "first_frame": int, "last_frame": int, "reported": bool, "vtype": str, "vconf": float, "box": [] } }
+        tracked_meta = {}
 
         # VideoWriter Setup
         codecs = [('mp4v', 'mp4'), ('XVID', 'avi')]
@@ -491,6 +531,7 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                                 min_dist = dist
                                 vehicle_tid = tid
                                 cls_id = int(tracked.class_id[i])
+                                # Fallback base type
                                 v_type = VEHICLE_TYPE_MAP.get(cls_id, "unknown")
                                 vehicle_full_box = [int(vbox[0]), int(vbox[1]), int(vbox[2]), int(vbox[3])]
 
@@ -500,6 +541,17 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                                     aspect = vh_box / vw if vw > 0 else 0
                                     if vw * vh_box < (w * h * 0.15) and aspect > 0.8:
                                         v_type = "Auto-Rickshaw"
+
+                        # Update Tracking Metadata for Zero-Miss
+                        if vehicle_tid is not None:
+                            if vehicle_tid not in tracked_meta:
+                                tracked_meta[vehicle_tid] = {
+                                    "first_frame": frame_count, "last_frame": frame_count,
+                                    "reported": False, "vtype": v_type, "vconf": 0.0, "box": vehicle_full_box
+                                }
+                            else:
+                                tracked_meta[vehicle_tid]["last_frame"] = frame_count
+                                tracked_meta[vehicle_tid]["box"] = vehicle_full_box
 
                     print(f"🔍 Plate detected: {res['text']} (conf={res['conf']:.2f})")
 
@@ -541,12 +593,12 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                         vy2 = min(h, vehicle_full_box[3])
                         vehicle_crop_for_type = frame[vy1:vy2, vx1:vx2]
                     else:
-                        # Fallback: use enlarged plate region
+                        # Fallback: use enlarged plate region (with more padding for better context)
                         b = res["box"]
-                        vx1 = max(0, b[0] - 100)
-                        vy1 = max(0, b[1] - 100)
-                        vx2 = min(w, b[2] + 100)
-                        vy2 = min(h, b[3] + 100)
+                        vx1 = max(0, b[0] - 250) # Increased padding
+                        vy1 = max(0, b[1] - 250)
+                        vx2 = min(w, b[2] + 250)
+                        vy2 = min(h, b[3] + 250)
                         vehicle_crop_for_type = frame[vy1:vy2, vx1:vx2]
 
                     # Ensure minimum 80×80 for best.pt
@@ -595,9 +647,12 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
 
                     cv2.imwrite(full_local, highlighted_frame)
 
-                    # ── Phase 1: High Quality Plate Crop ──
+                    # ── Phase 1: High Quality Plate Crop (25% padding to prevent half crops) ──
                     bw, bh_crop = b[2]-b[0], b[3]-b[1]
-                    pad_w, pad_h = int(bw * 0.15), int(bh_crop * 0.15)
+                    # FIX: Use 50% padding on each side - ensures FULL plate is always captured
+                    # even if the YOLO box clips the edge of the plate
+                    pad_w = int(bw * 0.50)
+                    pad_h = int(bh_crop * 0.50)
                     x1_pad = max(0, b[0] - pad_w)
                     y1_pad = max(0, b[1] - pad_h)
                     x2_pad = min(w, b[2] + pad_w)
@@ -605,13 +660,12 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
 
                     crop = frame[y1_pad:y2_pad, x1_pad:x2_pad]
                     if crop.size > 0:
-                        kernel = np.array([[-1,-1,-1], [-1,9,-1], [-1,-1,-1]])
-                        crop = cv2.filter2D(crop, -1, kernel)
                         ch, cw = crop.shape[:2]
-                        if cw < 300 or ch < 100:
+                        # Upscale if too small for readability
+                        if cw < 300 or ch < 80:
                             new_w = max(300, cw)
-                            new_h = int(new_w * (ch/cw))
-                            crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+                            new_h = int(new_w * (ch / cw)) if cw > 0 else 80
+                            crop = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_LANCZOS4)
                         cv2.imwrite(crop_local, crop)
                     else:
                         cv2.imwrite(crop_local, frame[b[1]:b[3], b[0]:b[2]])
@@ -627,12 +681,58 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                         print(f"⚠️ Vehicle type detection failed: {vte}")
                         v_type_res = {"type": "unknown", "confidence": 0.0}
 
-                    final_v_type = v_type_res["type"] if v_type_res["type"] != "unknown" else v_type
+                    # ── Confidence check — Fallback to base model if best.pt is unsure ──
+                    base_v_type = v_type  # From ByteTracker COCO class
+                    raw_vtype = v_type_res["type"].lower().strip() if v_type_res["type"] else "unknown"
                     v_conf = v_type_res["confidence"]
 
-                    # ── Step 6: Confidence check — UNKNOWN if below 60% ──
-                    if v_conf < 0.60:
-                        final_v_type = "UNKNOWN"
+                    # Map best.pt's raw label through our unified map
+                    mapped_best = VEHICLE_TYPE_MAP.get(raw_vtype, None)
+
+                    # ── Vehicle size sanity check ──
+                    # A large vehicle bounding box cannot be a Scooter or Bike.
+                    # If best.pt says two-wheeler but bbox area > 12% of frame, override.
+                    TWO_WHEELER_LABELS = {"Scooter", "Bike"}
+                    HEAVY_BASE_LABELS  = {"Car", "Bus", "Truck"}  # trustworthy base labels
+                    frame_area = w * h
+                    vehicle_area = 0
+                    if vehicle_full_box:
+                        vbw = vehicle_full_box[2] - vehicle_full_box[0]
+                        vbh = vehicle_full_box[3] - vehicle_full_box[1]
+                        vehicle_area = vbw * vbh
+                    is_large_vehicle = (vehicle_area > frame_area * 0.12) if frame_area > 0 else False
+
+                    # FIX: Raise threshold from 0.35 -> 0.55 so weak best.pt labels
+                    # don't override correct base YOLO labels (e.g. "scooter" @ 40%
+                    # should NOT beat "Car" from COCO class 2).
+                    BEST_PT_CONF_THRESHOLD = 0.55
+
+                    if mapped_best and v_conf >= BEST_PT_CONF_THRESHOLD:
+                        # best.pt gave a confident, known label
+                        # But if it says two-wheeler for a large vehicle, ignore it
+                        if mapped_best in TWO_WHEELER_LABELS and is_large_vehicle:
+                            print(f"[VTYPE SANITY] best.pt said '{mapped_best}' but vehicle is large ({vehicle_area}px²) — using base label '{base_v_type}'")
+                            final_v_type = base_v_type if base_v_type not in ["unknown", "Unknown", None, ""] else "Vehicle"
+                        else:
+                            final_v_type = mapped_best
+                    elif v_conf < BEST_PT_CONF_THRESHOLD:
+                        # best.pt is unsure — fall back to ByteTracker’s COCO class label
+                        final_v_type = base_v_type if (base_v_type and base_v_type not in ["unknown", "Unknown"]) else "Vehicle"
+                    else:
+                        # best.pt gave an unmapped label — use title-cased version
+                        final_v_type = raw_vtype.replace("_", " ").title() if raw_vtype != "unknown" else base_v_type or "Vehicle"
+
+                    # Final sanity check: never show bare 'Vehicle' if we have base info
+                    if final_v_type in ["Vehicle", "Unknown", "unknown"] and base_v_type not in ["unknown", "Unknown", None, ""]:
+                        final_v_type = base_v_type
+
+                    # Extra guard: if base label is a known heavy type (Car/Bus/Truck)
+                    # and best.pt says two-wheeler with conf < 0.70, protect the base label.
+                    if (base_v_type in HEAVY_BASE_LABELS
+                            and final_v_type in TWO_WHEELER_LABELS
+                            and v_conf < 0.70):
+                        print(f"[VTYPE GUARD] Protecting base label '{base_v_type}' — best.pt '{final_v_type}' conf={v_conf:.2f} too low")
+                        final_v_type = base_v_type
 
                     # Log vehicle type detection
                     print(f"[VEHICLE TYPE] plate={res['text']} type={final_v_type.upper()} conf={v_conf:.2f}")
@@ -641,8 +741,22 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                     if res.get("unread"):
                         status = "unread"
 
+                    # ── Duplicate Plate Filtering ──
+                    is_duplicate_in_job = False
+                    if status == "verified" and plate_cleanup != "N/A" and plate_cleanup != "UNREAD":
+                        if plate_cleanup in job_processed_plates:
+                            is_duplicate_in_job = True
+                        else:
+                            job_processed_plates.add(plate_cleanup)
+
+                    current_processing_time = time.time() - job_start_time
+
                     # ── Step 8: Save MongoDB + S3 + Telegram ──
-                    if res.get("verified_candidate"):
+                    if res.get("verified_candidate") and not is_duplicate_in_job:
+                        # Mark as reported for Zero-Miss coverage
+                        if vehicle_tid is not None and vehicle_tid in tracked_meta:
+                            tracked_meta[vehicle_tid]["reported"] = True
+
                         save_detection(
                             job_id=job_id,
                             frame=frame_count,
@@ -657,7 +771,10 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                             s3_vehicle_key=full_s3_key,
                             s3_plate_key=crop_s3_key,
                             fps=fps,
-                            visual_signature=v_sig
+                            visual_signature=v_sig,
+                            source_id="video_upload",
+                            job_status="processing",
+                            processing_time=current_processing_time
                         )
 
                         if job_id in jobs:
@@ -679,7 +796,19 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                         # ── TELEGRAM ALERT (Cooldown already handled above) ──
                         is_valid_plate = len(plate_cleanup) >= 7 and plate_cleanup != "UNREAD"
 
-                        if is_valid_plate:
+                        # ── TELEGRAM ALERT (Cooldown + Tracking ID Logic) ──
+                        is_valid_plate = len(plate_cleanup) >= 7 and plate_cleanup != "UNREAD"
+                        
+                        # Use Tracking ID for better deduplication if available
+                        alert_key = f"tid_{vehicle_tid}" if vehicle_tid is not None else f"plate_{plate_cleanup}"
+                        
+                        can_alert = True
+                        if alert_key in sent_alerts:
+                            if (current_time - sent_alerts[alert_key]) < 120: # 2-minute cooldown
+                                can_alert = False
+                        
+                        if is_valid_plate and can_alert:
+                            sent_alerts[alert_key] = current_time
                             timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                             combined_path = os.path.join(OUTPUT_DIR, f"alert_{job_id}_{frame_count}.jpg")
 
@@ -695,7 +824,7 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                                     vehicle_type=final_v_type,
                                     confidence=v_conf
                                 )
-                                print(f"✈️ Telegram alert sent: {res['text']} ({final_v_type}, conf={res['conf']:.2f})")
+                                print(f"✈️ Telegram alert sent: {res['text']} ({final_v_type}, conf={res['conf']:.2f}) [Key: {alert_key}]")
 
             # ── Other violation types ──────────────────────────────────────
             else:
@@ -738,6 +867,7 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                     full_s3_key = s3_upload_image(full_local, f"evidence/{full_name}")
                     crop_s3_key = s3_upload_image(crop_local, f"evidence/{crop_name}")
 
+                    current_processing_time = time.time() - job_start_time
                     # Save to MongoDB
                     save_detection(
                         job_id=job_id,
@@ -752,7 +882,10 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                         vehicle_type_confidence=0.0,
                         s3_vehicle_key=full_s3_key,
                         s3_plate_key=crop_s3_key,
-                        fps=fps
+                        fps=fps,
+                        source_id="video_upload",
+                        job_status="processing",
+                        processing_time=current_processing_time
                     )
 
                     if job_id in jobs:
@@ -786,8 +919,32 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
 
             out.write(frame)
 
+        # ── Step 9: Post-Processing Zero-Miss Coverage ──
+        # Any vehicle tracked for > 15 frames that was NEVER reported is forced as UNREAD
+        for tid, meta in tracked_meta.items():
+            if not meta["reported"] and (meta["last_frame"] - meta["first_frame"]) > 15:
+                print(f"📦 [ZERO-MISS] Forcing report for TrackID {tid} (No plate detected)")
+                # Force report so it shows in the table even without a plate
+                save_detection(
+                    job_id=job_id, frame=meta["last_frame"], vehicle_id=str(tid),
+                    plate="UNREAD", confidence=0.0, status="unread",
+                    violation_type="ANPR", vehicle_type=meta["vtype"].title(),
+                    vehicle_type_confidence=0.0,
+                    source_id="zero_miss_fallback"
+                )
+
         # Finalize job on success
+        current_processing_time = time.time() - job_start_time
         update_job_in_db(job_id, "completed", violation_count)
+        # Update metadata for all detections of this job
+        if db is not None:
+            db.vehicles.update_many(
+                {"job_id": job_id},
+                {"$set": {
+                    "job_status": "completed",
+                    "processing_time_seconds": current_processing_time
+                }}
+            )
         if job_id in jobs:
             jobs[job_id]["status"] = "completed"
         print(f"✅ Job completed successfully: {job_id}")
@@ -797,9 +954,108 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
         err_msg = str(e)
         print(f"❌ Job failed: {job_id} | Error: {err_msg}\n{traceback.format_exc()}")
         update_job_in_db(job_id, "failed", violation_count, error_message=err_msg)
+        if db is not None:
+            db.vehicles.update_many(
+                {"job_id": job_id},
+                {"$set": {"job_status": "failed", "error_message": err_msg}}
+            )
         if job_id in jobs:
-            jobs[job_id]["status"] = "failed"
-            jobs[job_id]["error"] = err_msg
+            jobs[job_id]["status"] = "error"
+    finally:
+        if cap: cap.release()
+        if out: out.release()
+
+# ── NEW API Endpoints ─────────────────────────────────────────────────────────
+
+@app.get("/traffic-analytics")
+def get_traffic_analytics(job_id: str = None):
+    """
+    Returns aggregated traffic and violation statistics.
+    If job_id is provided, filters by that specific video.
+    """
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database connection not available")
+    
+    query = {}
+    if job_id:
+        query["job_id"] = job_id
+        
+    try:
+        # 1. Total Vehicles (Count documents in 'vehicles' collection)
+        total_vehicles = db.vehicles.count_documents(query)
+        
+        # 2. Violation Counts
+        helmet_query = query.copy()
+        helmet_query["violations"] = "HELMET"
+        total_helmet = db.vehicles.count_documents(helmet_query)
+        
+        seatbelt_query = query.copy()
+        seatbelt_query["violations"] = "SEATBELT"
+        total_seatbelt = db.vehicles.count_documents(seatbelt_query)
+        
+        # 3. Vehicle Type Counts (all common Indian vehicle types)
+        vtypes = ["car", "bike", "truck", "scooter", "bus", "auto-rickshaw"]
+        type_counts = {}
+        for vt in vtypes:
+            type_query = query.copy()
+            type_query["vehicle_type"] = {"$regex": f"^{re.escape(vt)}$", "$options": "i"}
+            type_counts[vt] = db.vehicles.count_documents(type_query)
+
+        # 4. More violation types
+        wrong_side_query = query.copy()
+        wrong_side_query["violations"] = "WRONG_SIDE"
+        total_wrong_side = db.vehicles.count_documents(wrong_side_query)
+
+        triple_query = query.copy()
+        triple_query["violations"] = {"$regex": "TRIPLE", "$options": "i"}
+        total_triple = db.vehicles.count_documents(triple_query)
+
+        return {
+            "total_vehicles": total_vehicles,
+            "violations": {
+                "helmet": total_helmet,
+                "seatbelt": total_seatbelt,
+                "wrong_side": total_wrong_side,
+                "triple_riding": total_triple,
+            },
+            "vehicle_types": type_counts
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Analytics error: {str(e)}")
+
+
+@app.get("/search-plate")
+def search_plate_endpoint(number: str):
+    """
+    Returns all violations and metadata for a specific plate number.
+    """
+    if not number:
+        raise HTTPException(status_code=400, detail="Plate number required")
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database connection not available")
+        
+    try:
+        query = {"plate_number": number.strip().upper()}
+        results = list(db.vehicles.find(query).sort("created_at", -1))
+        
+        formatted_results = []
+        for r in results:
+            formatted_results.append({
+                "plate_number":   r.get("plate_number"),
+                "vehicle_type":   r.get("vehicle_type"),
+                "violation_type": r.get("violation_type", "ANPR"),
+                "violations":     r.get("violations", []),
+                "timestamp":      r.get("timestamp"),
+                "created_at":     r.get("created_at"),
+                "vehicle_image":  get_presigned_url(r.get("vehicle_image_url")),
+                "plate_crop_image": get_presigned_url(r.get("plate_image_url")),
+                "confidence":     r.get("confidence", 0.0),
+                "source_id":      r.get("source_id", "unknown")
+            })
+            
+        return formatted_results
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Search error: {str(e)}")
 
     finally:
         if cap: cap.release()
@@ -879,20 +1135,26 @@ def get_report(job_id: str, verified_only: bool = True):
 
     query = {"job_id": job_id}
     if verified_only:
-        query["status"] = "verified"
+        # Include both verified AND unread (vehicles detected but plate not read)
+        query["status"] = {"$in": ["verified", "unread"]}
     
     raw_results = list(db.vehicles.find(query).sort("frame_number", 1))
     
     # Map MongoDB fields to what the frontend expects
     report_data = []
     for r in raw_results:
+        plate_val = r.get("plate_number") or "N/A"
+        # Show UNKNOWN for unread plates (clearer than N/A)
+        if plate_val == "N/A" and r.get("status") == "unread":
+            plate_val = "UNKNOWN"
+        
         report_data.append({
             "Frame":            r.get("frame_number", 0),
             "Timestamp":        r.get("timestamp", "00:00:00"),
             "VehicleID":        r.get("vehicle_id", "N/A"),
-            "Type":             r.get("vehicle_type", "unknown"),
+            "Type":             r.get("vehicle_type", "Vehicle"),
             "TypeConfidence":   r.get("vehicle_type_confidence", 0.0),
-            "Plate":            r.get("plate_number") or "N/A",
+            "Plate":            plate_val,
             "Status":           r.get("status", "low_confidence"),
             "Confidence":       r.get("confidence", 0.0),
             "Violation":        r.get("violations")[0] if r.get("violations") else "ANPR",
@@ -1038,7 +1300,9 @@ def search_by_plate(plate: str, include_low_confidence: bool = False):
     return results
 
 @app.get("/api/search/vehicles")
-def search_vehicles(color: str = None, type: str = None, video_id: str = None, include_low_confidence: bool = False):
+def search_vehicles(color: str = None, type: str = None, video_id: str = None, 
+                   page: int = 1, limit: int = 20,
+                   include_low_confidence: bool = False):
     if db is None:
         raise HTTPException(status_code=503, detail="Database connection not available")
     query = {}
@@ -1048,7 +1312,8 @@ def search_vehicles(color: str = None, type: str = None, video_id: str = None, i
     if not include_low_confidence:
         query["status"] = "verified"
 
-    results = list(db.vehicles.find(query).sort("created_at", -1).limit(50))
+    skip = (page - 1) * limit
+    results = list(db.vehicles.find(query).sort("created_at", -1).skip(skip).limit(limit))
     for r in results:
         r["id"] = str(r["_id"])
         del r["_id"]
@@ -1056,18 +1321,26 @@ def search_vehicles(color: str = None, type: str = None, video_id: str = None, i
             r["vehicle_image_url"] = get_presigned_url(r["vehicle_image_url"])
         if r.get("plate_image_url"):
             r["plate_image_url"] = get_presigned_url(r["plate_image_url"])
-    return results
+    return {
+        "results": results,
+        "page": page,
+        "limit": limit,
+        "total": db.vehicles.count_documents(query)
+    }
 
 @app.get("/api/violations")
-def get_violations(type: str = None, include_low_confidence: bool = False):
+def get_violations(type: str = None, page: int = 1, limit: int = 20,
+                   include_low_confidence: bool = False, video_id: str = None):
     if db is None:
         raise HTTPException(status_code=503, detail="Database connection not available")
     query = {}
     if type: query["violations"] = type.upper()
+    if video_id: query["job_id"] = video_id  # Filter by specific job/video
     if not include_low_confidence:
         query["status"] = "verified"
         
-    results = list(db.vehicles.find(query).sort("created_at", -1).limit(50))
+    skip = (page - 1) * limit
+    results = list(db.vehicles.find(query).sort("created_at", -1).skip(skip).limit(limit))
     for r in results:
         r["id"] = str(r["_id"])
         del r["_id"]
@@ -1075,7 +1348,12 @@ def get_violations(type: str = None, include_low_confidence: bool = False):
             r["vehicle_image_url"] = get_presigned_url(r["vehicle_image_url"])
         if r.get("plate_image_url"):
             r["plate_image_url"] = get_presigned_url(r["plate_image_url"])
-    return results
+    return {
+        "results": results,
+        "page": page,
+        "limit": limit,
+        "total": db.vehicles.count_documents(query)
+    }
 
 @app.get("/api/search/time")
 def search_by_time(from_time: str = None, to_time: str = None, fuzzy: str = None, include_low_confidence: bool = False):
