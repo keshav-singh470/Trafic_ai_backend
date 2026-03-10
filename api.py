@@ -58,34 +58,85 @@ from shapely.geometry import Polygon
 
 # COCO class IDs (from yolov8n.pt base model) + best.pt string labels
 VEHICLE_TYPE_MAP = {
-    # COCO class IDs
-    1: "Bike",           # bicycle
-    2: "Car",            # car
-    3: "Bike",           # motorcycle
-    5: "Bus",            # bus
-    6: "Truck",          # train (rare, treat as truck)
-    7: "Truck",          # truck
-    8: "Truck",          # boat mapped to truck as fallback
-    # best.pt string labels (lowercased)
-    "car": "Car",
-    "bus": "Bus",
-    "truck": "Truck",
-    "bike": "Bike",
-    "motorcycle": "Bike",
-    "bicycle": "Bike",
-    "scooter": "Scooter",
-    "scooty": "Scooter",
-    "auto": "Auto-Rickshaw",
-    "autorickshaw": "Auto-Rickshaw",
-    "auto-rickshaw": "Auto-Rickshaw",
-    "auto rickshaw": "Auto-Rickshaw",
-    "rickshaw": "Auto-Rickshaw",
-    "tempo": "Truck",
-    "van": "Car",
-    "suv": "Car",
-    "sedan": "Car",
+    # ── yolov8n.pt COCO integer class IDs (ByteTrack base fallback only) ──
+    0:  "Person",
+    1:  "Bicycle",
+    2:  "Car",
+    3:  "Bike",
+    5:  "Bus",
+    6:  "Truck",
+    7:  "Truck",
+    8:  "Truck",
+
+    # ── best.pt EXACT string labels (6 classes) ──
+    "autorickshaw":  "Auto-Rickshaw",
+    "bus":           "Bus",
+    "car":           "Car",
+    "motorcycle":    "Bike",
+    "scooter":       "Scooter",
+    "truck":         "Truck",
+
+    # ── common variations ──
+    "auto":          "Auto-Rickshaw",
+    "bike":          "Bike",
+    "van":           "Car",
+    "lorry":         "Truck",
+    "tempo":         "Truck",
+    "minibus":       "Bus",
+    "ambulance":     "Car",
 }
 VEHICLE_COLORS = ["red", "blue", "white", "black", "silver", "unknown"]
+
+def get_majority_vtype(labels: List[str]):
+    """Returns the most frequent vehicle type label and its relative frequency."""
+    if not labels:
+        return "unknown", 0.0
+    from collections import Counter
+    counts = Counter(labels)
+    # Filter out 'unknown' if other valid labels exist
+    if len(counts) > 1 and ("unknown" in counts or "Unknown" in counts):
+        if "unknown" in counts: counts.pop("unknown")
+        if "Unknown" in counts: counts.pop("Unknown")
+        if not counts: return "unknown", 0.0
+            
+    most_common = counts.most_common(1)[0]
+    return most_common[0], most_common[1] / len(labels)
+
+def finalize_vtype_detection(base_v_type, voted_type, voted_conf, vehicle_bbox, frame_w, frame_h):
+    """Applies sanity checks and guards to determine the final vehicle type label."""
+    TWO_WHEELER_LABELS = {"Scooter", "Bike"}
+    HEAVY_BASE_LABELS  = {"Car", "Bus", "Truck"}
+    
+    frame_area = frame_w * frame_h
+    vehicle_area = 0
+    if vehicle_bbox:
+        vehicle_area = (vehicle_bbox[2]-vehicle_bbox[0]) * (vehicle_bbox[3]-vehicle_bbox[1])
+        
+    is_large_vehicle = (vehicle_area > frame_area * 0.12) if frame_area > 0 else False
+    
+    final_v_type = voted_type
+    
+    # 1. Size Sanity Check: Large objects aren't two-wheelers
+    if voted_type in TWO_WHEELER_LABELS and is_large_vehicle:
+        final_v_type = base_v_type if base_v_type not in ["unknown", "Unknown", None, ""] else "Vehicle"
+        
+    # 2. Confidence Guard: If voting is weak, trust the base YOLO model (COCO class)
+    BEST_PT_CONF_THRESHOLD = 0.55
+    if voted_conf < BEST_PT_CONF_THRESHOLD:
+        if base_v_type and base_v_type not in ["unknown", "Unknown"]:
+            final_v_type = base_v_type
+        elif final_v_type == "unknown":
+            final_v_type = "Vehicle"
+    
+    # 3. Heavy Protection: Protect Bus/Truck/Car labels from flip-flopping to two-wheelers
+    if (base_v_type in HEAVY_BASE_LABELS and final_v_type in TWO_WHEELER_LABELS and voted_conf < 0.70):
+        final_v_type = base_v_type
+        
+    # 4. Final Fallback
+    if final_v_type in ["Vehicle", "Unknown", "unknown"] and base_v_type not in ["unknown", "Unknown", None, ""]:
+        final_v_type = base_v_type
+        
+    return final_v_type
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -430,6 +481,10 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
     job_processed_plates = set()
     job_start_time = time.time()
     
+    # NEW: Vehicle Type Majority Voting Store
+    tid_vtype_history: Dict[int, List[str]] = {} # tid -> list of labels
+    pending_vtype_reports: List[Dict] = []       # reports waiting for more votes
+    
     try:
         # Select service
         if case_type in ["anpr", "security", "blacklist"]:
@@ -462,6 +517,90 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
         # NEW: Zero-Miss Tracking Metadata
         # { tid: { "first_frame": int, "last_frame": int, "reported": bool, "vtype": str, "vconf": float, "box": [] } }
         tracked_meta = {}
+
+        # NEW: Vehicle Type Majority Voting Store
+        tid_vtype_history: Dict[int, List[str]] = {} # tid -> list of labels
+        pending_vtype_reports: List[Dict] = []       # reports waiting for more votes
+
+        def finalize_and_report_vehicle(p):
+            """Helper to process a buffered report with majority voting and finalize it."""
+            try:
+                # 1. Get majority vote
+                tid_inner = p.get("tid")
+                votes = tid_vtype_history.get(tid_inner, [])
+                voted_type, voted_conf = get_majority_vtype(votes)
+                
+                # 2. Finalize with sanity checks
+                final_v_type_inner = finalize_vtype_detection(
+                    p["base_v_type"], voted_type, voted_conf, 
+                    p["vehicle_full_box"], w, h
+                )
+
+                # Use majority vote for vehicle type (Fix 2)
+                vtype_history = tid_vtype_history.get(tid_inner, [])
+                if vtype_history:
+                    type_counts = {}
+                    for t in vtype_history:
+                        if t and t.lower() not in ("unknown", "none", ""):
+                            type_counts[t] = type_counts.get(t, 0) + 1
+                    if type_counts:
+                        final_v_type_inner = max(type_counts, key=type_counts.get)
+
+                plate_val_log = p.get("plate", "N/A")
+                print(f"[VTYPE FINAL] plate={plate_val_log} | history={vtype_history} | final={final_v_type_inner}")
+                
+                # 3. Save to DB
+                save_detection(
+                    job_id=p["job_id"], frame=p["frame"], vehicle_id=str(p["tid"]),
+                    plate=p["plate"], confidence=p["confidence"], status=p["status"],
+                    violation_type=p["violation_type"], vehicle_type=final_v_type_inner,
+                    vehicle_color=p["vehicle_color"], vehicle_type_confidence=voted_conf,
+                    s3_vehicle_key=p["full_s3_key"], s3_plate_key=p["crop_s3_key"],
+                    fps=p["fps"], visual_signature=p["v_sig"],
+                    source_id=p["source_id"], job_status=p.get("job_status", "processing"),
+                    processing_time=time.time() - job_start_time
+                )
+                
+                # 4. Add to job stats for report table
+                if job_id in jobs:
+                    jobs[job_id]["report"].append({
+                        "Frame": p["frame"], "VehicleID": str(p["tid"]),
+                        "Type": final_v_type_inner, "Plate": p["plate"],
+                        "CropImgUrl": get_presigned_url(p["crop_s3_key"]),
+                        "FullImgUrl": get_presigned_url(p["full_s3_key"]),
+                        "vehicle_image": get_presigned_url(p["full_s3_key"]),
+                        "plate_image": get_presigned_url(p["crop_s3_key"]),
+                        "_s3_vehicle_key": p["full_s3_key"],
+                        "_s3_plate_key": p["crop_s3_key"]
+                    })
+                
+                # 5. Telegram Alert
+                plate_val = p.get("plate_cleanup", "N/A")
+                is_v_plate = len(plate_val) >= 7 and plate_val != "UNREAD"
+                alert_k = f"tid_{p['tid']}" if p.get('tid') else f"plate_{plate_val}"
+                
+                cur_t = time.time()
+                can_snd = True
+                if alert_k in sent_alerts:
+                    if (cur_t - sent_alerts[alert_k]) < 120: can_snd = False
+                
+                if is_v_plate and can_snd:
+                     sent_alerts[alert_k] = cur_t
+                     timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                     combined_p = os.path.join(OUTPUT_DIR, f"alert_{job_id}_{p['frame']}.jpg")
+                     if create_combined_image(p["full_local"], p["crop_local"], combined_p):
+                         send_local_violation(
+                             combined_path=combined_p, plate_text=p["plate"],
+                             job_id=job_id, case_type=case_type,
+                             violation_count=len(jobs[job_id]["report"]),
+                             status="Verified" if p["confidence"] >= 0.2 else "Low Confidence",
+                             timestamp=timestamp_now, vehicle_type=final_v_type_inner,
+                             confidence=voted_conf
+                         )
+                return True
+            except Exception as ex:
+                print(f"⚠️ Failed to finalize report for TID {p.get('tid')}: {ex}")
+                return False
 
         # VideoWriter Setup
         codecs = [('mp4v', 'mp4'), ('XVID', 'avi')]
@@ -497,8 +636,58 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                 with torch.no_grad():
                     _, tracked = service.process_frame(frame)
 
+                # ── NEW: Per-frame Vehicle Type Voting Collection ──
+                if tracked is not None and hasattr(tracked, 'tracker_id'):
+                    for i in range(len(tracked.tracker_id)):
+                        tid = int(tracked.tracker_id[i])
+                        vbox = tracked.xyxy[i]
+                        
+                        # Initialize history if new
+                        if tid not in tid_vtype_history:
+                            tid_vtype_history[tid] = []
+                        
+                        # Collect up to 30 votes per vehicle (10-20 frames recommended)
+                        if len(tid_vtype_history[tid]) < 30:
+                            vx1, vy1, vx2, vy2 = map(int, vbox)
+                            vx1, vy1 = max(0, vx1), max(0, vy1)
+                            vx2, vy2 = min(w, vx2), min(h, vy2)
+                            
+                            if vx2 - vx1 > 40 and vy2 - vy1 > 40: # Minimum size for quality
+                                v_crop = frame[vy1:vy2, vx1:vx2]
+                                
+                                def _vote_task(tid_inner, crop_img):
+                                    res = VEHICLE_TYPE_SERVICE.get_best_detection(crop_img)
+                                    # get_best_detection already returns mapped Indian category ("Car", "Bike", etc.)
+                                    # Do NOT remap through VEHICLE_TYPE_MAP — that caused wrong types (double-mapping bug)
+                                    vehicle_type = res.get("type", "unknown") if res else "unknown"
+                                    if not vehicle_type or vehicle_type.lower() in ("", "none", "unknown"):
+                                        vehicle_type = "unknown"
+                                    tid_vtype_history[tid_inner].append(vehicle_type)
+                                
+                                # Run classification in thread pool
+                                vtype_executor.submit(_vote_task, tid, v_crop.copy())
+
                 # ── Step 1 (cont): YOLO plate detection (runs at 640px inside anpr_service) ──
                 all_detections, to_report = service.run_detection(frame, frame_count)
+
+                # ── NEW: Process Pending Reports ──
+                remaining_pending = []
+                curr_t_ids = []
+                if tracked is not None and hasattr(tracked, 'tracker_id'):
+                    curr_t_ids = tracked.tracker_id.tolist()
+
+                for pend in pending_vtype_reports:
+                    tid_p = pend["tid"]
+                    vts_p = tid_vtype_history.get(tid_p, [])
+                    # Finalize if we have 15 votes OR if the vehicle is no longer in frame
+                    if len(vts_p) >= 15 or tid_p not in curr_t_ids:
+                        finalize_and_report_vehicle(pend)
+                        # Sync global violation count
+                        if job_id in jobs:
+                            violation_count = len(jobs[job_id]["report"])
+                    else:
+                        remaining_pending.append(pend)
+                pending_vtype_reports = remaining_pending
 
                 # ── Step 7 (partial): Draw DIM GREY box on all unconfirmed detections ──
                 #    Only confirmed reads get bright green boxes (drawn below in to_report loop)
@@ -535,12 +724,21 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                                 v_type = VEHICLE_TYPE_MAP.get(cls_id, "unknown")
                                 vehicle_full_box = [int(vbox[0]), int(vbox[1]), int(vbox[2]), int(vbox[3])]
 
-                                # ── Auto-Rickshaw Heuristic ──
-                                if cls_id == 5:  # Bus
-                                    vw, vh_box = vbox[2]-vbox[0], vbox[3]-vbox[1]
-                                    aspect = vh_box / vw if vw > 0 else 0
-                                    if vw * vh_box < (w * h * 0.15) and aspect > 0.8:
+                                # ── Improved Vehicle Heuristic ──
+                                vw_box = vbox[2] - vbox[0]
+                                vh_box = vbox[3] - vbox[1]
+                                aspect = vh_box / vw_box if vw_box > 0 else 0
+                                vehicle_area_ratio = (vw_box * vh_box) / (w * h) if w * h > 0 else 0
+
+                                if cls_id == 5:  # COCO "bus" — small one is likely Auto-Rickshaw
+                                    if vehicle_area_ratio < 0.12 and 0.7 < aspect < 1.4:
                                         v_type = "Auto-Rickshaw"
+                                elif cls_id == 7:  # COCO "truck" — small one might be tempo/auto
+                                    if vehicle_area_ratio < 0.08 and aspect > 0.6:
+                                        v_type = "Auto-Rickshaw"
+                                elif cls_id == 3:  # COCO "motorcycle" — wide one is scooter
+                                    if vw_box > vh_box * 1.5:
+                                        v_type = "Scooter"
 
                         # Update Tracking Metadata for Zero-Miss
                         if vehicle_tid is not None:
@@ -586,35 +784,15 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
 
                     # ── Step 4: best.pt on FULL vehicle bbox (in thread) ──
                     # Extract full vehicle image from tracked bbox (min 80×80)
-                    if vehicle_full_box:
-                        vx1 = max(0, vehicle_full_box[0])
-                        vy1 = max(0, vehicle_full_box[1])
-                        vx2 = min(w, vehicle_full_box[2])
-                        vy2 = min(h, vehicle_full_box[3])
-                        vehicle_crop_for_type = frame[vy1:vy2, vx1:vx2]
-                    else:
-                        # Fallback: use enlarged plate region (with more padding for better context)
-                        b = res["box"]
-                        vx1 = max(0, b[0] - 250) # Increased padding
-                        vy1 = max(0, b[1] - 250)
-                        vx2 = min(w, b[2] + 250)
-                        vy2 = min(h, b[3] + 250)
-                        vehicle_crop_for_type = frame[vy1:vy2, vx1:vx2]
-
-                    # Ensure minimum 80×80 for best.pt
-                    vch, vcw = vehicle_crop_for_type.shape[:2] if vehicle_crop_for_type is not None and vehicle_crop_for_type.size > 0 else (0, 0)
-                    if vch < 80 or vcw < 80:
-                        if vch > 0 and vcw > 0:
-                            vehicle_crop_for_type = cv2.resize(vehicle_crop_for_type, (max(80, vcw), max(80, vch)))
-
-                    # Run best.pt in thread for speed
-                    def _detect_vtype(crop_img):
-                        with torch.no_grad():
-                            return VEHICLE_TYPE_SERVICE.get_best_detection(crop_img)
-
-                    vtype_future = vtype_executor.submit(_detect_vtype, vehicle_crop_for_type.copy())
+                    print(f"[DEBUG VTYPE] plate={res.get('plate','?')} | vehicle_full_box={vehicle_full_box} | tid={res.get('track_id','?')}")
+                    # Vehicle type comes from Block 1 voting only — no reclassification here
+                    pass
 
                     assets_id = uuid.uuid4().hex[:8]
+                    full_name  = f"anpr_{assets_id}.jpg"
+                    crop_name  = f"anpr_crop_{assets_id}.jpg"
+                    full_local = os.path.join(assets_dir, full_name)
+                    crop_local = os.path.join(assets_dir, crop_name)
                     full_name  = f"anpr_{assets_id}.jpg"
                     crop_name  = f"anpr_crop_{assets_id}.jpg"
                     full_local = os.path.join(assets_dir, full_name)
@@ -674,157 +852,45 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                     full_s3_key = s3_upload_image(full_local, f"evidence/{full_name}")
                     crop_s3_key = s3_upload_image(crop_local, f"evidence/{crop_name}")
 
-                    # Wait for vehicle type result from thread
-                    try:
-                        v_type_res = vtype_future.result(timeout=5.0)
-                    except Exception as vte:
-                        print(f"⚠️ Vehicle type detection failed: {vte}")
-                        v_type_res = {"type": "unknown", "confidence": 0.0}
-
-                    # ── Confidence check — Fallback to base model if best.pt is unsure ──
-                    base_v_type = v_type  # From ByteTracker COCO class
-                    raw_vtype = v_type_res["type"].lower().strip() if v_type_res["type"] else "unknown"
-                    v_conf = v_type_res["confidence"]
-
-                    # Map best.pt's raw label through our unified map
-                    mapped_best = VEHICLE_TYPE_MAP.get(raw_vtype, None)
-
-                    # ── Vehicle size sanity check ──
-                    # A large vehicle bounding box cannot be a Scooter or Bike.
-                    # If best.pt says two-wheeler but bbox area > 12% of frame, override.
-                    TWO_WHEELER_LABELS = {"Scooter", "Bike"}
-                    HEAVY_BASE_LABELS  = {"Car", "Bus", "Truck"}  # trustworthy base labels
-                    frame_area = w * h
-                    vehicle_area = 0
-                    if vehicle_full_box:
-                        vbw = vehicle_full_box[2] - vehicle_full_box[0]
-                        vbh = vehicle_full_box[3] - vehicle_full_box[1]
-                        vehicle_area = vbw * vbh
-                    is_large_vehicle = (vehicle_area > frame_area * 0.12) if frame_area > 0 else False
-
-                    # FIX: Raise threshold from 0.35 -> 0.55 so weak best.pt labels
-                    # don't override correct base YOLO labels (e.g. "scooter" @ 40%
-                    # should NOT beat "Car" from COCO class 2).
-                    BEST_PT_CONF_THRESHOLD = 0.55
-
-                    if mapped_best and v_conf >= BEST_PT_CONF_THRESHOLD:
-                        # best.pt gave a confident, known label
-                        # But if it says two-wheeler for a large vehicle, ignore it
-                        if mapped_best in TWO_WHEELER_LABELS and is_large_vehicle:
-                            print(f"[VTYPE SANITY] best.pt said '{mapped_best}' but vehicle is large ({vehicle_area}px²) — using base label '{base_v_type}'")
-                            final_v_type = base_v_type if base_v_type not in ["unknown", "Unknown", None, ""] else "Vehicle"
+                    # ── BUFFER REPORT FOR MAJORITY VOTING ──
+                    if vehicle_tid is not None:
+                        report_pend = {
+                            "job_id": job_id, "frame": frame_count, "tid": vehicle_tid,
+                            "plate": res["text"], "confidence": res["conf"],
+                            "status": "unread" if res.get("unread") else ("verified" if res["conf"] >= 0.2 else "low_confidence"),
+                            "violation_type": "ANPR", "vehicle_color": v_color, "v_sig": v_sig, "fps": fps,
+                            "full_local": full_local, "crop_local": crop_local,
+                            "full_s3_key": full_s3_key, "crop_s3_key": crop_s3_key,
+                            "plate_cleanup": plate_cleanup, "base_v_type": v_type,
+                            "vehicle_full_box": vehicle_full_box, "source_id": "video_upload"
+                        }
+                        
+                        v_votes_loop = tid_vtype_history.get(vehicle_tid, [])
+                        if len(v_votes_loop) >= 15:
+                            # Finalize immediately if we already have 15+ votes
+                            finalize_and_report_vehicle(report_pend)
+                            if job_id in jobs: violation_count = len(jobs[job_id]["report"])
                         else:
-                            final_v_type = mapped_best
-                    elif v_conf < BEST_PT_CONF_THRESHOLD:
-                        # best.pt is unsure — fall back to ByteTracker’s COCO class label
-                        final_v_type = base_v_type if (base_v_type and base_v_type not in ["unknown", "Unknown"]) else "Vehicle"
-                    else:
-                        # best.pt gave an unmapped label — use title-cased version
-                        final_v_type = raw_vtype.replace("_", " ").title() if raw_vtype != "unknown" else base_v_type or "Vehicle"
-
-                    # Final sanity check: never show bare 'Vehicle' if we have base info
-                    if final_v_type in ["Vehicle", "Unknown", "unknown"] and base_v_type not in ["unknown", "Unknown", None, ""]:
-                        final_v_type = base_v_type
-
-                    # Extra guard: if base label is a known heavy type (Car/Bus/Truck)
-                    # and best.pt says two-wheeler with conf < 0.70, protect the base label.
-                    if (base_v_type in HEAVY_BASE_LABELS
-                            and final_v_type in TWO_WHEELER_LABELS
-                            and v_conf < 0.70):
-                        print(f"[VTYPE GUARD] Protecting base label '{base_v_type}' — best.pt '{final_v_type}' conf={v_conf:.2f} too low")
-                        final_v_type = base_v_type
-
-                    # Log vehicle type detection
-                    print(f"[VEHICLE TYPE] plate={res['text']} type={final_v_type.upper()} conf={v_conf:.2f}")
-
-                    status = "verified" if res["conf"] >= 0.2 else "low_confidence"
-                    if res.get("unread"):
-                        status = "unread"
-
-                    # ── Duplicate Plate Filtering ──
-                    is_duplicate_in_job = False
-                    if status == "verified" and plate_cleanup != "N/A" and plate_cleanup != "UNREAD":
-                        if plate_cleanup in job_processed_plates:
-                            is_duplicate_in_job = True
-                        else:
-                            job_processed_plates.add(plate_cleanup)
-
-                    current_processing_time = time.time() - job_start_time
-
-                    # ── Step 8: Save MongoDB + S3 + Telegram ──
-                    if res.get("verified_candidate") and not is_duplicate_in_job:
+                            pending_vtype_reports.append(report_pend)
+                            print(f"⏳ [BUFFERED] Plate {res['text']} (TID {vehicle_tid}, votes {len(v_votes_loop)}/15)")
+                        
                         # Mark as reported for Zero-Miss coverage
-                        if vehicle_tid is not None and vehicle_tid in tracked_meta:
+                        if vehicle_tid in tracked_meta:
                             tracked_meta[vehicle_tid]["reported"] = True
-
+                    else:
+                        # Fallback for untracked
                         save_detection(
-                            job_id=job_id,
-                            frame=frame_count,
-                            vehicle_id=str(vehicle_tid) if vehicle_tid is not None else "N/A",
-                            plate=res["text"],
-                            confidence=res["conf"],
-                            status=status,
-                            violation_type="ANPR",
-                            vehicle_type=final_v_type,
-                            vehicle_color=v_color,
-                            vehicle_type_confidence=v_conf,
-                            s3_vehicle_key=full_s3_key,
-                            s3_plate_key=crop_s3_key,
-                            fps=fps,
-                            visual_signature=v_sig,
-                            source_id="video_upload",
-                            job_status="processing",
-                            processing_time=current_processing_time
+                            job_id=job_id, frame=frame_count, vehicle_id="N/A",
+                            plate=res["text"], confidence=res["conf"], 
+                            status="unread" if res.get("unread") else "verified",
+                            violation_type="ANPR", vehicle_type=v_type,
+                            vehicle_color=v_color, vehicle_type_confidence=0.0,
+                            s3_vehicle_key=full_s3_key, s3_plate_key=crop_s3_key,
+                            fps=fps, visual_signature=v_sig,
+                            source_id="video_upload", job_status="processing"
                         )
-
-                        if job_id in jobs:
-                            jobs[job_id]["report"].append({
-                                "Frame": frame_count,
-                                "VehicleID": str(vehicle_tid) if vehicle_tid is not None else "N/A",
-                                "Type": final_v_type,
-                                "Plate": res["text"],
-                                "CropImgUrl": get_presigned_url(crop_s3_key),
-                                "FullImgUrl": get_presigned_url(full_s3_key),
-                                "vehicle_image": get_presigned_url(full_s3_key),
-                                "plate_image": get_presigned_url(crop_s3_key),
-                                "_s3_vehicle_key": full_s3_key,
-                                "_s3_plate_key": crop_s3_key
-                            })
-
                         violation_count += 1
 
-                        # ── TELEGRAM ALERT (Cooldown already handled above) ──
-                        is_valid_plate = len(plate_cleanup) >= 7 and plate_cleanup != "UNREAD"
-
-                        # ── TELEGRAM ALERT (Cooldown + Tracking ID Logic) ──
-                        is_valid_plate = len(plate_cleanup) >= 7 and plate_cleanup != "UNREAD"
-                        
-                        # Use Tracking ID for better deduplication if available
-                        alert_key = f"tid_{vehicle_tid}" if vehicle_tid is not None else f"plate_{plate_cleanup}"
-                        
-                        can_alert = True
-                        if alert_key in sent_alerts:
-                            if (current_time - sent_alerts[alert_key]) < 120: # 2-minute cooldown
-                                can_alert = False
-                        
-                        if is_valid_plate and can_alert:
-                            sent_alerts[alert_key] = current_time
-                            timestamp_now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                            combined_path = os.path.join(OUTPUT_DIR, f"alert_{job_id}_{frame_count}.jpg")
-
-                            if create_combined_image(full_local, crop_local, combined_path):
-                                send_local_violation(
-                                    combined_path=combined_path,
-                                    plate_text=res["text"],
-                                    job_id=job_id,
-                                    case_type=case_type,
-                                    violation_count=violation_count,
-                                    status="Verified" if res["conf"] >= 0.2 else "Low Confidence",
-                                    timestamp=timestamp_now,
-                                    vehicle_type=final_v_type,
-                                    confidence=v_conf
-                                )
-                                print(f"✈️ Telegram alert sent: {res['text']} ({final_v_type}, conf={res['conf']:.2f}) [Key: {alert_key}]")
 
             # ── Other violation types ──────────────────────────────────────
             else:
@@ -918,6 +984,14 @@ def process_video_task(job_id: str, input_path: str, output_path: str,
                     service.mark_alerted(v["id"], "N/A")
 
             out.write(frame)
+
+        # ── Step 9-B: Final Flush of Pending Reports ──
+        if pending_vtype_reports:
+            print(f"🏁 [JOB {job_id}] Video ended. Flushing {len(pending_vtype_reports)} remaining reports...")
+            for p_flush in pending_vtype_reports:
+                finalize_and_report_vehicle(p_flush)
+            pending_vtype_reports.clear()
+            if job_id in jobs: violation_count = len(jobs[job_id]["report"])
 
         # ── Step 9: Post-Processing Zero-Miss Coverage ──
         # Any vehicle tracked for > 15 frames that was NEVER reported is forced as UNREAD
@@ -1151,8 +1225,8 @@ def get_report(job_id: str, verified_only: bool = True):
         report_data.append({
             "Frame":            r.get("frame_number", 0),
             "Timestamp":        r.get("timestamp", "00:00:00"),
-            "VehicleID":        r.get("vehicle_id", "N/A"),
-            "Type":             r.get("vehicle_type", "Vehicle"),
+            "VehicleID":        r.get("track_id") or r.get("vehicle_id") or str(r.get("_id", ""))[:6] or "N/A",
+            "Type":             r.get("vehicle_type") or r.get("class") or "unknown",
             "TypeConfidence":   r.get("vehicle_type_confidence", 0.0),
             "Plate":            plate_val,
             "Status":           r.get("status", "low_confidence"),

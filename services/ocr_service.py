@@ -44,10 +44,15 @@ class OCRService:
             # Initialize PaddleOCR with angle classifier enabled for rotated plates
             self.ocr = PaddleOCR(
                 lang=lang,
-                use_angle_cls=True,
+                use_angle_cls=False,
                 use_gpu=False,
-                cpu_threads=2,
-                enable_mkldnn=False
+                cpu_threads=4,
+                enable_mkldnn=False,
+                det_db_score_mode='fast',
+                rec_batch_num=1,
+                max_text_length=12,
+                det_limit_side_len=640,
+                drop_score=0.4
             )
             self._initialized = True
             logger.info("PaddleOCR engine initialized successfully.")
